@@ -1,0 +1,70 @@
+.chat-container { 
+    padding: 10px; 
+    height: 95vh; 
+    display: flex; 
+    flex-direction: column; 
+    background: var(--vscode-editor-background);
+}
+
+.input-area { 
+    padding: 10px; 
+    background: var(--vscode-editorWidget-background);
+    border-top: 1px solid var(--vscode-editorWidget-border);
+}
+
+textarea { 
+    width: 100%; 
+    padding: 8px; 
+    resize: none; 
+    background: var(--vscode-editorWidget-background);
+    border: 1px solid var(--vscode-editorWidget-border);
+    border-radius: 4px;
+    color: var(--vscode-editor-foreground);
+}
+
+button { 
+    float: right; 
+    margin-top: 5px; 
+}
+
+.message { 
+    margin: 5px 0; 
+    padding: 8px; 
+    border-radius: 4px; 
+}
+
+.user { 
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.bot { 
+    background: var(--vscode-editorWidget-background);
+}
+
+.error { 
+    color: var(--vscode-errorForeground);
+}
+
+#sendButton {
+    background-color: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    cursor: pointer;
+}
+
+#sendButton:hover {
+    background-color: var(--vscode-button-hoverBackground);
+}
+
+#sendButton:active {
+    background-color: var(--vscode-button-activeBackground);
+}
+
+#messages {
+    flex: 1;
+    overflow-y: scroll;
+    background: var(--vscode-editor-background);
+}
