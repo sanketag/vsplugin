@@ -1,69 +1,96 @@
 {
-  "name": "diplugin",
-  "displayName": "DIPlugin",
-  "description": "AI-powered coding assistant with chat.",
-  "version": "1.0.0",
-  "engines": {
-    "vscode": "^1.85.0"
-  },
-  "categories": [
-    "Programming Languages",
-    "Snippets",
-    "Other"
-  ],
-  "icon": "media/icon.png",
-  "activationEvents": [
-    "onCommand:diplugin.openChat",
-    "onCommand:diplugin.refactorCode",
-    "onLanguage:javascript",
-    "onLanguage:python"
-  ],
-  "contributes": {
-    "commands": [
-      {
-        "command": "diplugin.openChat",
-        "title": "Open AI Chat"
-      },
-      {
-        "command": "diplugin.refactorCode",
-        "title": "Refactor Code"
-      }
+    "name": "diplugin",
+    "displayName": "DIPlugin",
+    "description": "AI-powered coding assistant with chat.",
+    "version": "1.0.0",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Snippets",
+        "Other"
     ],
-    "configuration": {
-      "title": "AI Chat",
-      "properties": {
-        "aiChat.apiBaseUrl": {
-          "type": "string",
-          "default": "http://your-api-endpoint",
-          "description": "Base URL for AI API"
+    "icon": "media/icon.png",
+    "activationEvents": [
+        "onCommand:diplugin.focusChat",
+        "onWebviewView:diplugin.chatView",
+        "onCommand:diplugin.refactorCode",
+        "onLanguage:javascript",
+        "onLanguage:python"
+    ],
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "diplugin-sidebar",
+                    "title": "AI Chat",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "diplugin-sidebar": [
+                {
+                    "id": "diplugin.chatView",
+                    "name": "AI Chat",
+                    "type": "webview"
+                }
+            ]
+        },
+        "commands": [
+            {
+                "command": "diplugin.focusChat",
+                "title": "Focus AI Chat",
+                "category": "AI Chat"
+            },
+            {
+                "command": "diplugin.refactorCode",
+                "title": "Refactor Code"
+            }
+        ],
+        "configuration": {
+            "title": "AI Chat",
+            "properties": {
+                "aiChat.apiBaseUrl": {
+                    "type": "string",
+                    "default": "http://your-api-endpoint",
+                    "description": "Base URL for AI API"
+                }
+            }
         }
-      }
-    }
-  },
-  "main": "./out/extension.js",
-  "type": "commonjs",
-  "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "package": "npm run compile && vsce package --ignoreFile .vscodeignore"
-  },
-  "dependencies": {
-    "dompurify": "^3.0.5",
-    "jsdom": "^22.1.0",
-    "marked": "^7.0.2",
-    "node-fetch": "^2.6.7"
-  },
-  "devDependencies": {
-    "@types/node-fetch": "^2.6.2",
-    "@types/marked": "^4.0.7",
-    "@types/vscode": "^1.85.0",
-    "typescript": "^5.2.2"
-  },
-  "keywords": ["ai", "chat", "completion"],
-  "publisher": "local-dev",
-  "repository": {
-    "type": "git",
-    "url": "https://example.com/your-repo"
-  },
-  "license": "MIT"
+    },
+    "main": "./out/extension.js",
+    "type": "commonjs",
+    "scripts": {
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "package": "npm run compile && vsce package --ignoreFile .vscodeignore"
+    },
+    "dependencies": {
+        "@vscode/codicons": "^0.0.36",
+        "dompurify": "^3.0.5",
+        "highlight.js": "^11.11.1",
+        "jsdom": "^22.1.0",
+        "lodash": "^4.17.21",
+        "marked": "^7.0.5",
+        "node-fetch": "^2.6.7"
+    },
+    "devDependencies": {
+        "@types/marked": "^4.0.7",
+        "@types/node-fetch": "^2.6.2",
+        "@types/vscode": "^1.85.0",
+        "typescript": "^5.2.2"
+    },
+    "keywords": [
+        "ai",
+        "chat",
+        "completion"
+    ],
+    "publisher": "local-dev",
+    "repository": {
+        "type": "git",
+        "url": "https://example.com/your-repo"
+    },
+    "license": "MIT"
 }
