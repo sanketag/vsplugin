@@ -1,3 +1,4 @@
+// extension.ts
 import * as vscode from 'vscode';
 import fetch from 'node-fetch';
 import { getNonce } from './utils';
@@ -246,7 +247,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         
         if (session) {
             // Check if file already exists in context
-            const exists = session.contextFiles.some(f => f.path === fileUri.fsPath);
+            const normalizedPath = fileUri.fsPath.replace(/\\/g, '/');
+            const exists = session.contextFiles.some(f => f.path.replace(/\\/g, '/') === normalizedPath);
             
             if (!exists) {
                 session.contextFiles.push({
@@ -264,7 +266,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async _removeContextFile(filePath: string): Promise<void> {
         const session = this._currentSession;
         if (session) {
-            session.contextFiles = session.contextFiles.filter(f => f.path !== filePath);
+            const normalizedFilePath = filePath.replace(/\\/g, '/');
+            session.contextFiles = session.contextFiles.filter(f => f.path.replace(/\\/g, '/') !== normalizedFilePath);
             await this._saveSessions();
             this._updateWebview();
         }
@@ -911,7 +914,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             document.getElementById('contextFilesSection').classList.remove('hidden');
                             
                             contextFilesList.innerHTML = files.map(file => {
-                                const pathParts = file.path.split(/[/\\]/);
+                                const pathParts = file.path;
                                 const fileName = pathParts[pathParts.length - 1];
                                 const fileIcon = getFileIcon(fileName);
                                 
@@ -942,7 +945,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }
                     
                     function getFileIcon(fileName) {
-                        const ext = fileName.split('.').pop().toLowerCase();
+                        const baseName = fileName.split('/').pop() || '';
+                        const ext = baseName.split('.').pop()?.toLowerCase() || '';
                         const icons = {
                             'js': 'codicon-symbol-field',
                             'ts': 'codicon-symbol-field',
@@ -1177,7 +1181,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     function truncateText(text, maxLength) {
                         if (!text) return '';
-                        text = text.replace(/\n/g, ' ').trim();
+                        text = text.trim();
                         return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
                     }
 
@@ -1194,9 +1198,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 export function activate(context: vscode.ExtensionContext) {
     const provider = new ChatViewProvider(context, context.extensionUri);
     
-    // Expose provider commands for external access
-    (provider as any)._view = undefined;
+    // Register completion provider
+    class AIChatCompletionProvider implements vscode.CompletionItemProvider {
+        async provideCompletionItems(document: vscode.TextDocument, position: vscode.Position) {
+            try {
+                const response = await fetch('http://127.0.0.1:5000/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        code: document.getText(),
+                        line: position.line,
+                        character: position.character
+                    })
+                });
+                
+                const data = await response.json();
+                return data.suggestions.map((suggestion: string) => 
+                    new vscode.CompletionItem(suggestion, vscode.CompletionItemKind.Snippet));
+            } catch (error) {
+                console.error('Completion error:', error);
+                return [];
+            }
+        }
+    }
 
+    // Register commands and providers
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider),
         vscode.commands.registerCommand('diplugin.focusChat', async () => {
@@ -1206,11 +1232,15 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diplugin.newChat', async () => {
             await vscode.commands.executeCommand('workbench.view.extension.diplugin-sidebar');
             await vscode.commands.executeCommand('diplugin.focusChat');
-            // The provider will be accessible through the extension
-            (provider as any)._view?.webview.postMessage({ command: 'newChat' });
-        })
+        }),
+        vscode.languages.registerCompletionItemProvider(
+            ['javascript', 'python', 'typescript'],
+            new AIChatCompletionProvider(),
+            '.', '"', "'", ' ', '('
+        )
     );
 
+    // Status bar item
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.text = "$(comment-discussion) AI Chat";
     statusBarItem.tooltip = "Open AI Chat";
