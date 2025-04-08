@@ -1,0 +1,32 @@
+# Optimized CPU-based deployment
+FROM python:3.10-slim
+
+# System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    libopenblas-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python setup
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install llama-cpp-python --no-cache-dir --compile \
+    --use-pep517 --no-binary=llama-cpp-python \
+    -DCMAKE_ARGS="-DLLAMA_OPENBLAS=ON -DLLAMA_OPENMP=ON"
+
+# Application
+COPY . .
+
+# Runtime config
+ENV OLLAMA_HOST="http://localhost:11434"
+ENV REDIS_HOST="redis"
+ENV MAX_MEMORY="55GB"
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
