@@ -11,6 +11,7 @@ import python from 'highlight.js/lib/languages/python';
 import json from 'highlight.js/lib/languages/json';
 import xml from 'highlight.js/lib/languages/xml';
 import css from 'highlight.js/lib/languages/css';
+import { TextDocument, Position } from 'vscode';
 
 // Register common languages for syntax highlighting
 hljs.registerLanguage('javascript', javascript);
@@ -30,6 +31,14 @@ interface ChatMessage {
     codeSuggestion?: string;
     codeLanguage?: string;
     isStreaming?: boolean;
+}
+
+interface CodeContext {
+    filePath: string;
+    code: string;
+    language: string;
+    selection?: string;
+    position?: Position;
 }
 
 interface ContextFile {
@@ -113,6 +122,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._updateWebview();
         }, 500);
     }
+
+    private async _getEnhancedContext(): Promise<CodeContext> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return Promise.resolve(null as CodeContext);
+
+        const document = editor.document;
+        const selection = editor.selection;
+        const selectedText = selection.isEmpty ? '' : document.getText(selection);
+
+        return {
+            filePath: document.uri.fsPath,
+            code: document.getText(),
+            language: document.languageId,
+            selection: selectedText,
+            position: selection.active
+        };
+    }
+
+    private async _handleCodeAction(action: string): Promise<void> {
+        const context = await this._getEnhancedContext();
+        if (!context) {
+            vscode.window.showErrorMessage('No active editor found');
+            return;
+        }
+
+        let prompt = '';
+        switch (action) {
+            case 'explainCode':
+                prompt = `Explain this ${context.language} code:\n\n${context.selection || context.code}\n\nFocus on data migration patterns and Airflow best practices.`;
+                break;
+            case 'generateTest':
+                prompt = `Generate a test case for this ${context.language} code:\n\n${context.selection || context.code}\n\nInclude assertions for data validation.`;
+                break;
+            // Add other cases...
+        }
+
+        if (prompt) {
+            await this._handleUserMessage(prompt);
+        }
+    }
     
     private _setWebviewMessageListener(webviewView: vscode.WebviewView): void {
         webviewView.webview.onDidReceiveMessage(async (message) => {
@@ -133,6 +182,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'quickAction':
                     await this._handleQuickAction(message.action);
+                    break;
+                case 'codeAction':
+                    await this._handleCodeAction(message.action);
                     break;
                 case 'applyCodeSuggestion':
                     await this._applyCodeSuggestion(message.code);
@@ -592,6 +644,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                     </button>
                                 </div>
                                 <div id="contextFilesList"></div>
+                            </div>
+                            <div class="context-actions">
+                                <button id="attachContext" class="action-button" title="Attach current code context">
+                                    <span class="codicon codicon-code"></span> Attach Code
+                                </button>
+                                <button id="clearContext" class="action-button" title="Clear context">
+                                    <span class="codicon codicon-clear-all"></span> Clear
+                                </button>
+                            </div>
+                            
+                            <div id="contextStatus" class="context-status">
+                                <span class="codicon codicon-info"></span>
+                                <span id="contextInfo">No code context attached</span>
                             </div>
                         </div>
                         

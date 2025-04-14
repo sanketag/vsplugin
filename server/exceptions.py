@@ -11,3 +11,13 @@ class ModelOverloadError(Exception):
 class ValidationError(Exception):
     """Raised when validation fails"""
     pass
+
+
+class RateLimitError(Exception):
+    """Raised when rate limits are exceeded"""
+    pass
+
+
+class CodeAnalysisError(Exception):
+    """Raised when code analysis fails"""
+    pass

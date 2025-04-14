@@ -8,20 +8,21 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Callable
+from typing import Callable, Union
 
 import psutil
 import redis
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from exceptions import ValidationError
 from faiss_index import CodeVectorStore
 # Local imports
-from ollama_helper import CodeGenerator
+from ollama_helper import CodeGenerator, ModelOverloadError
 from schemas import *
 from utils import (
-    get_relevant_context, cache_result, get_cached,
+    get_relevant_context, get_cached,
     generate_cache_key, build_completion_prompt, build_review_prompt,
     build_optimization_prompt, parse_review_result, cache_stream,
     generate_metrics, get_related_code
@@ -162,43 +163,97 @@ async def code_completion(request: CodeCompletionRequest):
     )
 
 
+@app.post("/v1/chat")
+async def chat_with_context(request: dict):
+    """
+    Enhanced chat endpoint with code context
+    {
+        "message": "user message",
+        "context": {
+            "file_path": "current_file.py",
+            "code": "current code content",
+            "language": "python",
+            "selection": "selected code if any"
+        },
+        "model": "gpt-4"
+    }
+    """
+    try:
+        # First try to find relevant code from vector store
+        relevant_code = await get_relevant_context(
+            app.state.vector_store,
+            request.get("message", "") + "\n" + request.get("context", {}).get("code", "")
+        )
+
+        # Build prompt with context
+        prompt = f"""**[Code Context]**
+File: {request.get('context', {}).get('file_path', 'N/A')}
+Language: {request.get('context', {}).get('language', 'N/A')}
+
+**[Relevant Code from Repository]**
+{relevant_code if relevant_code else 'No similar code found in repository'}
+
+**[User Message]**
+{request.get('message', '')}
+
+**[Current Code Context]**
+{request.get('context', {}).get('code', '')}
+
+Please provide a helpful response considering both the existing codebase and the current file context.
+"""
+
+        # Generate response
+        stream_generator = app.state.generator.stream(
+            prompt=prompt,
+            max_tokens=1024,
+            temperature=0.3
+        )
+
+        return StreamingResponse(
+            stream_generator,
+            media_type="text/event-stream"
+        )
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/review", response_model=CodeReviewResponse)
 # @handle_errors
 async def code_review(request: CodeReviewRequest):
-    """
-    Code review with standards validation
-    {
-        "code": "full_code_content",
-        "lang": "python",
-        "strict_mode": true
-    }
-    """
+    # First search vector DB for similar code patterns
+    similar_code_results = await asyncio.to_thread(
+        app.state.vector_store.search,
+        query=request.code,
+        k=3,
+        file_filter=os.path.dirname(request.file_path) if request.file_path else None
+    )
+
+    # If we find highly similar code (low score = better match)
+    relevant_issues = []
+    for doc in similar_code_results:
+        if doc['score'] < 0.3:  # Threshold for strong similarity
+            # Extract any known issues from similar code
+            review_prompt = build_review_prompt(doc['content'], request.lang)
+            cached_review = await get_cached(app.state.cache, generate_cache_key(review_prompt))
+
+            if cached_review:
+                relevant_issues.extend(cached_review['issues'])
+
+    if relevant_issues:
+        return {"issues": relevant_issues, "source": "existing_code"}
+
+    # Fall back to LLM only if no good matches found
     review_prompt = build_review_prompt(request.code, request.lang)
-    print(review_prompt)
-    cache_key = generate_cache_key(review_prompt)
-    print(cache_key)
-
-    cached = await get_cached(app.state.cache, cache_key)
-    if cached:
-        import json
-        return JSONResponse(json.loads(cached))
-
-    # Generate review
-    start_time = time.monotonic()
-    print(start_time)
     result = await asyncio.to_thread(
         app.state.generator.generate,
         review_prompt,
         max_tokens=512
     )
-    print(result)
 
-    # Process and validate issues
     issues = parse_review_result(result)
-    await cache_result(app.state.cache, cache_key, {"issues": issues})
-
-    logger.info(f"Review completed in {time.monotonic() - start_time:.2f}s")
-    return {"issues": issues}
+    return {"issues": issues, "source": "generated"}
 
 
 @app.post("/v1/optimize")
@@ -289,6 +344,28 @@ async def prometheus_metrics():
         content=generate_metrics(),
         media_type="text/plain"
     )
+
+
+@app.middleware("http")
+async def error_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except ModelOverloadError:
+        return JSONResponse(
+            {"error": "Model overloaded - try again later"},
+            status_code=503
+        )
+    except ValidationError as e:
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=422
+        )
+    except Exception as e:
+        logger.exception("Unexpected error")
+        return JSONResponse(
+            {"error": "Internal server error"},
+            status_code=500
+        )
 
 
 if __name__ == "__main__":
