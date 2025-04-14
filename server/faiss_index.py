@@ -5,12 +5,11 @@ FAISS-based vector store for code retrieval with:
 - File-based filtering
 """
 
-from langchain.text_splitter import Language
+from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader
-from langchain_text_splitters import LanguageParser
 from langchain_community.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from typing import List, Optional
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from typing import List, Optional, Dict, Any
 import os
 
 class CodeVectorStore:
@@ -42,9 +41,10 @@ class CodeVectorStore:
         )
         documents = loader.load()
 
-        splitter = LanguageParser(
-            language=Language.PYTHON,
-            parser_threshold=500
+        splitter = RecursiveCharacterTextSplitter.from_language(
+            language="python",
+            chunk_size=500,
+            chunk_overlap=50
         )
         chunks = splitter.split_documents(documents)
 
@@ -57,7 +57,7 @@ class CodeVectorStore:
         query: str,
         k: int = 3,
         file_filter: Optional[str] = None
-    ) -> List[dict]:
+    ) -> List[Dict[str, Any]]:
         """
         Search for relevant code snippets
         Args:
@@ -67,19 +67,20 @@ class CodeVectorStore:
         Returns:
             List of relevant documents with metadata
         """
-        docs = self.index.similarity_search(query, k=k)
+        docs_with_scores = self.index.similarity_search_with_score(query, k=k)
         
-        if file_filter:
-            docs = [
-                doc for doc in docs
-                if doc.metadata['source'].startswith(file_filter)
-            ]
+        results = []
+        for doc, score in docs_with_scores:
+            if file_filter and not doc.metadata['source'].startswith(file_filter):
+                continue
+            
+            results.append({
+                'content': doc.page_content,
+                'path': doc.metadata['source'],
+                'score': float(score)
+            })
         
-        return [{
-            'content': doc.page_content,
-            'path': doc.metadata['source'],
-            'score': doc.metadata.get('score', 0)
-        } for doc in docs]
+        return results
 
     def update_index(self):
         """Refresh index with new code"""

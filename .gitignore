@@ -38,7 +38,7 @@ Desktop.ini
 # Editor directories and files
 .vscode/
 .vscode-test/
-.idea/
+**/.idea/**
 *.swp
 *.swo
 *.sublime-workspace
@@ -58,3 +58,5 @@ lcov.info
 # Temporary files
 temp/
 tmp/
+
+**/venv

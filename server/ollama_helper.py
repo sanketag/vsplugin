@@ -5,12 +5,14 @@ Ollama Model Wrapper with:
 - Automatic retries
 """
 
-import ollama
-from threading import Lock
-import psutil
 import time
-from typing import Optional, Generator
 from dataclasses import dataclass
+from threading import Lock
+from typing import Generator, Dict, Any
+
+import ollama
+import psutil
+
 
 @dataclass
 class GenerationConfig:
@@ -20,23 +22,26 @@ class GenerationConfig:
     repeat_penalty: float = 1.1
     num_ctx: int = 4096
 
+
 class ModelOverloadError(Exception):
     pass
 
+
 class CodeGenerator:
-    def __init__(self, num_threads: int = 6):
+    def __init__(self, model_name: str = "qwen2.5-coder", num_threads: int = 6):
         self.client = ollama.Client()
         self.lock = Lock()
         self.config = GenerationConfig()
         self.num_threads = num_threads
         self.last_used = time.time()
+        self.model_name = model_name
 
     def warmup(self):
         """Pre-load model into memory"""
         with self.lock:
             self._generate("Warmup", max_tokens=1)
 
-    def status(self) -> dict:
+    def status(self) -> Dict[str, Any]:
         """Get current model status"""
         mem = psutil.virtual_memory()
         return {
@@ -83,7 +88,7 @@ class CodeGenerator:
         self._check_resources()
         try:
             response = self.client.generate(
-                model='qwen2.5-coder',
+                model=self.model_name,
                 prompt=prompt,
                 options={
                     **self.config.__dict__,
@@ -102,7 +107,7 @@ class CodeGenerator:
         self._check_resources()
         try:
             stream = self.client.generate(
-                model='qwen2.5-coder',
+                model=self.model_name,
                 prompt=prompt,
                 options={
                     **self.config.__dict__,
