@@ -13,11 +13,12 @@
     ],
     "icon": "media/icon.png",
     "activationEvents": [
+        "onStartupFinished",
+        "onView:diplugin.chatView",
         "onCommand:diplugin.focusChat",
-        "onWebviewView:diplugin.chatView",
-        "onCommand:diplugin.refactorCode",
         "onLanguage:javascript",
-        "onLanguage:python"
+        "onLanguage:python",
+        "onLanguage:typescript"
     ],
     "contributes": {
         "viewsContainers": {
@@ -25,7 +26,7 @@
                 {
                     "id": "diplugin-sidebar",
                     "title": "AI Chat",
-                    "icon": "media/icon.svg"
+                    "icon": "media/icon.png"
                 }
             ]
         },
@@ -41,21 +42,128 @@
         "commands": [
             {
                 "command": "diplugin.focusChat",
-                "title": "Focus AI Chat",
-                "category": "AI Chat"
+                "title": "Open AI Chat",
+                "category": "AI Chat",
+                "icon": "$(comment-discussion)"
+            },
+            {
+                "command": "diplugin.newChat",
+                "title": "New Chat",
+                "category": "AI Chat",
+                "icon": "$(add)"
             },
             {
                 "command": "diplugin.refactorCode",
+                "when": "editorHasSelection",
+                "group": "1_modification",
                 "title": "Refactor Code"
+            },
+            {
+                "command": "diplugin.acceptRefactoring",
+                "title": "Accept Code Refactoring",
+                "category": "AI Chat"
+            },
+            {
+                "command": "diplugin.rejectRefactoring",
+                "title": "Reject Code Refactoring",
+                "category": "AI Chat"
+            },
+            {
+                "command": "diplugin.explainCode",
+                "title": "AI Explain Code",
+                "category": "AI Chat"
+            },
+            {
+                "command": "diplugin.askAi",
+                "title": "Ask AI"
+            },
+            {
+                "command": "diplugin.triggerInlineCompletion",
+                "title": "Trigger AI Inline Completion"
             }
         ],
+        "keybindings": [
+            {
+                "command": "diplugin.triggerInlineCompletion",
+                "key": "alt+/",
+                "when": "editorTextFocus"
+            },
+            {
+                "command": "diplugin.acceptRefactoring",
+                "key": "enter",
+                "when": "focusedView == codeRefactorDiff"
+            },
+            {
+                "command": "diplugin.rejectRefactoring",
+                "key": "escape",
+                "when": "focusedView == codeRefactorDiff"
+            },
+            {
+                "command": "diplugin.refactorCode",
+                "key": "ctrl+shift+r",
+                "mac": "cmd+shift+r",
+                "when": "editorHasSelection"
+            }
+        ],
+        "menus": {
+            "view/title": [
+                {
+                    "command": "diplugin.newChat",
+                    "when": "view == diplugin.chatView",
+                    "group": "navigation"
+                }
+            ],
+            "editor/context": [
+                {
+                    "command": "diplugin.explainCode",
+                    "when": "editorHasSelection",
+                    "group": "1_modification"
+                },
+                {
+                    "command": "diplugin.refactorCode",
+                    "when": "editorHasSelection",
+                    "group": "1_modification"
+                },
+                {
+                    "command": "diplugin.askAi",
+                    "when": "editorHasSelection",
+                    "group": "1_modification"
+                }
+            ]
+        },
         "configuration": {
             "title": "AI Chat",
             "properties": {
                 "aiChat.apiBaseUrl": {
                     "type": "string",
-                    "default": "http://your-api-endpoint",
-                    "description": "Base URL for AI API"
+                    "default": "http://127.0.0.1:9693",
+                    "description": "API endpoint for the AI backend"
+                },
+                "aiChat.defaultModel": {
+                    "type": "string",
+                    "default": "gpt-4",
+                    "enum": [
+                        "gpt-4",
+                        "gpt-3.5",
+                        "claude-3-opus",
+                        "claude-3-sonnet"
+                    ],
+                    "description": "Default model to use for chat"
+                },
+                "aiChat.autoAttachContext": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically attach context file"
+                },
+                "aiChat.enableInlineCompletions": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Enable AI inline code completions"
+                },
+                "aiChat.inlineCompletionDelay": {
+                    "type": "number",
+                    "default": 500,
+                    "description": "Delay in milliseconds before triggering inline completions"
                 }
             }
         }
@@ -65,19 +173,23 @@
     "scripts": {
         "compile": "tsc -p ./",
         "watch": "tsc -watch -p ./",
-        "package": "npm run compile && vsce package --ignoreFile .vscodeignore",
+        "package": "npm run compile && vsce package",
         "postinstall": "node ./scripts/postinstall.js"
     },
     "dependencies": {
         "@vscode/codicons": "^0.0.36",
+        "axios": "^1.8.4",
+        "diff": "^7.0.0",
         "dompurify": "^3.0.5",
         "highlight.js": "^11.11.1",
         "jsdom": "^22.1.0",
         "lodash": "^4.17.21",
         "marked": "^7.0.5",
+        "marked-highlight": "^2.2.1",
         "node-fetch": "^2.6.7"
     },
     "devDependencies": {
+        "@types/diff": "^7.0.2",
         "@types/jsdom": "^21.1.0",
         "@types/marked": "^4.0.7",
         "@types/node-fetch": "^2.6.2",

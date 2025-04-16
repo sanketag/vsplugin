@@ -1,8 +1,8 @@
-// extension.ts
 import * as vscode from 'vscode';
 import fetch from 'node-fetch';
-import { getNonce } from './utils';
+import { getNonce, getFileIcon } from './utils';
 import { marked } from 'marked';
+import { markedHighlight } from 'marked-highlight';
 import { Readable } from 'stream';
 import hljs from 'highlight.js/lib/core';
 import javascript from 'highlight.js/lib/languages/javascript';
@@ -11,7 +11,9 @@ import python from 'highlight.js/lib/languages/python';
 import json from 'highlight.js/lib/languages/json';
 import xml from 'highlight.js/lib/languages/xml';
 import css from 'highlight.js/lib/languages/css';
-import { TextDocument, Position } from 'vscode';
+import * as path from 'path';
+import axios from 'axios';
+import { diffLines } from 'diff'
 
 // Register common languages for syntax highlighting
 hljs.registerLanguage('javascript', javascript);
@@ -21,7 +23,8 @@ hljs.registerLanguage('json', json);
 hljs.registerLanguage('xml', xml);
 hljs.registerLanguage('css', css);
 
-const API_BASE_URL = 'http://127.0.0.1:5000';
+// Use the configurable API URL instead of hardcoding
+let API_BASE_URL = 'http://127.0.0.1:9693'; // Default value
 
 interface ChatMessage {
     id: string;
@@ -38,7 +41,7 @@ interface CodeContext {
     code: string;
     language: string;
     selection?: string;
-    position?: Position;
+    position?: vscode.Position;
 }
 
 interface ContextFile {
@@ -63,6 +66,531 @@ interface ChatSettings {
     showTimestamps: boolean;
 }
 
+interface AICompletionSettings {
+    enabled: boolean;
+    delay: number;
+    autoTrigger: boolean;
+}
+
+export class CodeRefactoringProvider {
+    private _context: vscode.ExtensionContext;
+    private _statusBarItem: vscode.StatusBarItem;
+    private _abortController?: AbortController;
+    private _decoration: vscode.TextEditorDecorationType;
+    private _addedLineDecoration: vscode.TextEditorDecorationType;
+    private _removedLineDecoration: vscode.TextEditorDecorationType;
+    private _inlineRefactoringPanel?: vscode.WebviewPanel;
+    private _isRefactoringInProgress: boolean = false;
+
+    constructor(context: vscode.ExtensionContext) {
+        this._context = context;
+        
+        // Create status bar item for showing refactoring status
+        this._statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+        this._context.subscriptions.push(this._statusBarItem);
+        
+        // Initialize decoration types for highlighting changes
+        this._decoration = vscode.window.createTextEditorDecorationType({
+            border: '1px solid #888',
+            backgroundColor: 'rgba(100, 100, 255, 0.1)'
+        });
+        
+        this._addedLineDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(80, 200, 80, 0.2)',
+            isWholeLine: true,
+            before: {
+                contentText: '+ ',
+                color: 'green'
+            }
+        });
+        
+        this._removedLineDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(255, 100, 100, 0.2)',
+            isWholeLine: true,
+            before: {
+                contentText: '- ',
+                color: 'red'
+            }
+        });
+        
+        // Load initial configuration
+        const config = vscode.workspace.getConfiguration('aiChat');
+        if (config.has('apiBaseUrl')) {
+            API_BASE_URL = config.get('apiBaseUrl') as string;
+        }
+        
+        // Register commands for accepting/rejecting refactoring
+        this._context.subscriptions.push(
+            vscode.commands.registerCommand('diplugin.acceptRefactoring', () => this._handleAcceptRefactoring()),
+            vscode.commands.registerCommand('diplugin.rejectRefactoring', () => this._handleRejectRefactoring())
+        );
+    }
+
+    public async refactorSelectedCode(): Promise<void> {
+        // Check if refactoring is already in progress
+        if (this._isRefactoringInProgress) {
+            vscode.window.showInformationMessage('A refactoring operation is already in progress');
+            return;
+        }
+        
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showInformationMessage('No active editor');
+            return;
+        }
+
+        const selection = editor.selection;
+        if (selection.isEmpty) {
+            vscode.window.showInformationMessage('No code selected for refactoring');
+            return;
+        }
+
+        const selectedCode = editor.document.getText(selection);
+        const targetVersion = await this._promptForTargetVersion();
+        if (!targetVersion) return; // User cancelled
+
+        this._isRefactoringInProgress = true;
+        this._showRefactoringStatus('$(sync~spin) Refactoring...');
+        
+        try {
+            const refactoredCode = await this._callRefactorApi(selectedCode, targetVersion);
+            if (refactoredCode) {
+                await this._showInlineRefactorPreview(selectedCode, refactoredCode, selection);
+            }
+        } catch (error) {
+            this._hideRefactoringStatus();
+            this._isRefactoringInProgress = false;
+            if (error instanceof Error) {
+                vscode.window.showErrorMessage(`Refactoring failed: ${error.message}`);
+            } else {
+                vscode.window.showErrorMessage('Refactoring failed with an unknown error');
+            }
+        }
+    }
+
+    private async _promptForTargetVersion(): Promise<string | undefined> {
+        const versions = ['airflow2.6', 'airflow2.5', 'airflow2.4', 'airflow2.0'];
+        return vscode.window.showQuickPick(versions, {
+            placeHolder: 'Select target Airflow version',
+            title: 'Refactor Code'
+        });
+    }
+
+    private async _callRefactorApi(code: string, targetVersion: string): Promise<string> {
+        this._abortController = new AbortController();
+        const signal = this._abortController.signal;
+        
+        try {
+            const response = await fetch(`${API_BASE_URL}/v1/refactor`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    code: code,
+                    target_version: targetVersion
+                }),
+                signal
+            });
+    
+            if (!response.ok) {
+                throw new Error(`API Error: ${response.status}`);
+            }
+    
+            // Handle streaming response
+            const reader = Readable.toWeb(response.body as any).getReader();
+            if (!reader) {
+                throw new Error('Failed to get response reader');
+            }
+            
+            const decoder = new TextDecoder();
+            let fullResponse = '';
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                const chunk = decoder.decode(value, { stream: true });
+                fullResponse += chunk;
+            }
+            
+            return fullResponse;
+        } finally {
+            this._abortController = undefined;
+        }
+    }
+    
+    private _currentDecorations?: {
+        preview: vscode.TextEditorDecorationType;
+        codelens: vscode.Disposable;
+        timeout: NodeJS.Timeout;
+    };
+
+    private async _showInlineRefactorPreview(originalCode: string, refactoredCode: string, selection: vscode.Selection): Promise<void> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        
+        // Calculate the diff
+        const changes = diffLines(originalCode, refactoredCode);
+        
+        // Clear any existing decorations
+        editor.setDecorations(this._decoration, []);
+        
+        // Create decoration for the inline preview
+        const inlinePreviewDecoration = vscode.window.createTextEditorDecorationType({
+            after: {
+                contentText: this._getInlinePreviewText(changes),
+                margin: '10px 0 0 0',
+                border: '1px solid var(--vscode-panel-border)',
+                backgroundColor: 'var(--vscode-editor-background)',
+                width: 'max-content',
+                height: 'max-content',
+                color: 'var(--vscode-editor-foreground)'
+            },
+            isWholeLine: true
+        });
+        
+        // Apply decoration at the start of selection
+        const decorationRange = new vscode.Range(
+            selection.start.line, 0,
+            selection.start.line, 0
+        );
+        
+        editor.setDecorations(inlinePreviewDecoration, [decorationRange]);
+        
+        // Apply diff decorations to highlight changes in the editor
+        this._applyDiffDecorations(editor, selection, originalCode, refactoredCode);
+        
+        this._hideRefactoringStatus();
+        
+        // Create buttons for accept/reject using Codelens
+        const acceptCodeLensProvider: vscode.CodeLensProvider = {
+            provideCodeLenses: (document: vscode.TextDocument) => {
+                if (document.uri.toString() !== editor.document.uri.toString()) return [];
+                
+                const range = new vscode.Range(selection.start.line, 0, selection.start.line, 0);
+                
+                const acceptLens = new vscode.CodeLens(range, {
+                    title: '✓ Accept',
+                    command: 'diplugin.acceptRefactoring',
+                    arguments: [refactoredCode, selection]
+                });
+                
+                const rejectLens = new vscode.CodeLens(range, {
+                    title: '✗ Reject',
+                    command: 'diplugin.rejectRefactoring',
+                    arguments: []
+                });
+                
+                return [acceptLens, rejectLens];
+            }
+        };
+        
+        // Register the codelens provider temporarily
+        const codeLensDisposable = vscode.languages.registerCodeLensProvider(
+            { pattern: editor.document.uri.fsPath },
+            acceptCodeLensProvider
+        );
+        
+        // Set a timer to remove decorations if user doesn't interact
+        const decorationTimeout = setTimeout(() => {
+            inlinePreviewDecoration.dispose();
+            editor.setDecorations(this._addedLineDecoration, []);
+            editor.setDecorations(this._removedLineDecoration, []);
+            codeLensDisposable.dispose();
+            this._isRefactoringInProgress = false;
+        }, 60000); // Remove after 1 minute of inactivity
+        
+        // Store these to dispose later
+        this._currentDecorations = {
+            preview: inlinePreviewDecoration,
+            codelens: codeLensDisposable,
+            timeout: decorationTimeout
+        };
+    }
+    
+    // Helper method to generate the text content for the inline preview
+    private _getInlinePreviewText(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
+        let previewText = 'Refactoring Preview:\n';
+        
+        changes.forEach(change => {
+            if (change.added) {
+                previewText += `+ ${change.value.trim()}\n`;
+            } else if (change.removed) {
+                previewText += `- ${change.value.trim()}\n`;
+            } else {
+                previewText += `  ${change.value.trim()}\n`;
+            }
+        });
+        
+        return previewText + '\n[Enter to Accept, Esc to Reject]';
+    }
+    
+    private _applyDiffDecorations(
+        editor: vscode.TextEditor, 
+        selection: vscode.Selection,
+        originalCode: string, 
+        refactoredCode: string
+    ): void {
+        const originalLines = originalCode.split('\n');
+        const refactoredLines = refactoredCode.split('\n');
+        
+        const changes = diffLines(originalCode, refactoredCode);
+        
+        const addedRanges: vscode.Range[] = [];
+        const removedRanges: vscode.Range[] = [];
+        
+        let lineOffset = selection.start.line;
+        let currentLine = 0;
+        
+        changes.forEach(change => {
+            const lineCount = change.value.split('\n').length - 1;
+            
+            if (change.added) {
+                // Highlight added lines in green
+                const startLine = lineOffset + currentLine;
+                const endLine = startLine + lineCount;
+                
+                for (let i = startLine; i <= endLine; i++) {
+                    const line = editor.document.lineAt(i);
+                    addedRanges.push(line.range);
+                }
+                
+                currentLine += lineCount;
+            } else if (change.removed) {
+                // Highlight removed lines in red
+                const startLine = lineOffset + currentLine;
+                const endLine = startLine + lineCount;
+                
+                for (let i = startLine; i <= endLine; i++) {
+                    if (i < editor.document.lineCount) {
+                        const line = editor.document.lineAt(i);
+                        removedRanges.push(line.range);
+                    }
+                }
+            } else {
+                // Unchanged lines
+                currentLine += lineCount;
+            }
+        });
+        
+        // Apply decorations
+        editor.setDecorations(this._addedLineDecoration, addedRanges);
+        editor.setDecorations(this._removedLineDecoration, removedRanges);
+    }
+
+    private _getInlinePreviewContent(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
+        const nonce = getNonce();
+        
+        return `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline';">
+                <title>Code Refactor Preview</title>
+                <style>
+                    body {
+                        font-family: var(--vscode-editor-font-family, 'Segoe UI');
+                        font-size: var(--vscode-editor-font-size, 12px);
+                        padding: 0;
+                        margin: 0;
+                        background-color: var(--vscode-editor-background, #1e1e1e);
+                        color: var(--vscode-editor-foreground, #d4d4d4);
+                    }
+                    .container {
+                        display: flex;
+                        flex-direction: column;
+                        padding: 6px;
+                        max-height: 200px;
+                        overflow: auto;
+                    }
+                    .header {
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        margin-bottom: 6px;
+                        user-select: none;
+                    }
+                    .title {
+                        font-weight: bold;
+                        font-size: 14px;
+                    }
+                    .actions {
+                        display: flex;
+                        gap: 8px;
+                    }
+                    button {
+                        padding: 4px 8px;
+                        background-color: var(--vscode-button-background, #0e639c);
+                        color: var(--vscode-button-foreground, white);
+                        border: none;
+                        border-radius: 2px;
+                        cursor: pointer;
+                    }
+                    button:hover {
+                        background-color: var(--vscode-button-hoverBackground, #1177bb);
+                    }
+                    .keyboard-shortcut {
+                        opacity: 0.7;
+                        margin-left: 4px;
+                        font-size: 10px;
+                    }
+                    
+                    /* Hides the preview panel when not needed, CSS only approach */
+                    .diffPreview {
+                        display: ${changes.length > 0 ? 'block' : 'none'};
+                        margin-top: 4px;
+                        max-height: 150px;
+                        overflow: auto;
+                        border: 1px solid var(--vscode-panel-border, #555);
+                        border-radius: 3px;
+                    }
+                    .line {
+                        padding: 1px 4px;
+                        font-family: var(--vscode-editor-font-family, monospace);
+                        white-space: pre;
+                    }
+                    .added {
+                        background-color: rgba(80, 200, 80, 0.2);
+                        color: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
+                    }
+                    .removed {
+                        background-color: rgba(255, 100, 100, 0.2);
+                        color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+                    }
+                    .unchanged {
+                        color: var(--vscode-editor-foreground, #d4d4d4);
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <div class="title">Refactoring Preview</div>
+                        <div class="actions">
+                            <button id="reject">Reject <span class="keyboard-shortcut">(Esc)</span></button>
+                            <button id="accept">Accept <span class="keyboard-shortcut">(Enter)</span></button>
+                        </div>
+                    </div>
+                    
+                    <div class="diffPreview">
+                        ${changes.map(change => {
+                            const className = change.added ? 'added' : change.removed ? 'removed' : 'unchanged';
+                            const prefix = change.added ? '+ ' : change.removed ? '- ' : '  ';
+                            return `<div class="line ${className}">${prefix}${this._escapeHtml(change.value)}</div>`;
+                        }).join('')}
+                    </div>
+                </div>
+                
+                <script nonce="${nonce}">
+                    const vscode = acquireVsCodeApi();
+                    
+                    document.getElementById('accept').addEventListener('click', () => {
+                        vscode.postMessage({ command: 'accept' });
+                    });
+                    
+                    document.getElementById('reject').addEventListener('click', () => {
+                        vscode.postMessage({ command: 'reject' });
+                    });
+                    
+                    window.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            vscode.postMessage({ command: 'accept' });
+                            e.preventDefault();
+                        } else if (e.key === 'Escape' || e.key === 'Backspace') {
+                            vscode.postMessage({ command: 'reject' });
+                            e.preventDefault();
+                        }
+                    });
+                </script>
+            </body>
+            </html>
+        `;
+    }
+
+    private async _handleAcceptRefactoring(refactoredCode?: string, selection?: vscode.Selection): Promise<void> {
+        // Clean up decorations
+        if (this._currentDecorations) {
+            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
+            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
+            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
+            this._currentDecorations = undefined;
+        }
+        
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        
+        // Clear decorations
+        editor.setDecorations(this._addedLineDecoration, []);
+        editor.setDecorations(this._removedLineDecoration, []);
+        
+        // Apply the refactoring if provided
+        if (refactoredCode && selection) {
+            await this._applyRefactoring(refactoredCode, selection);
+        }
+        
+        this._isRefactoringInProgress = false;
+    }
+    
+    private async _handleRejectRefactoring(): Promise<void> {
+        // Clean up decorations
+        if (this._currentDecorations) {
+            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
+            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
+            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
+            this._currentDecorations = undefined;
+        }
+        
+        const editor = vscode.window.activeTextEditor;
+        if (editor) {
+            editor.setDecorations(this._addedLineDecoration, []);
+            editor.setDecorations(this._removedLineDecoration, []);
+        }
+        
+        this._isRefactoringInProgress = false;
+        vscode.window.showInformationMessage('Refactoring rejected');
+    }
+
+    private async _applyRefactoring(refactoredCode: string, selection: vscode.Selection): Promise<void> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        
+        await editor.edit(editBuilder => {
+            editBuilder.replace(selection, refactoredCode);
+        });
+        
+        vscode.window.showInformationMessage('Code successfully refactored');
+    }
+
+    private _showRefactoringStatus(text: string): void {
+        this._statusBarItem.text = text;
+        this._statusBarItem.show();
+    }
+
+    private _hideRefactoringStatus(): void {
+        this._statusBarItem.hide();
+    }
+
+    private _escapeHtml(unsafe: string): string {
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    public dispose(): void {
+        this._statusBarItem.dispose();
+        this._decoration.dispose();
+        this._addedLineDecoration.dispose();
+        this._removedLineDecoration.dispose();
+        if (this._inlineRefactoringPanel) {
+            this._inlineRefactoringPanel.dispose();
+        }
+    }
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'diplugin.chatView';
     private _view?: vscode.WebviewView;
@@ -85,7 +613,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     
     private async _initialize(): Promise<void> {
+        // Load API config from VSCode settings
+        const config = vscode.workspace.getConfiguration('aiChat');
+        if (config.has('apiBaseUrl')) {
+            API_BASE_URL = config.get('apiBaseUrl') as string;
+        }
+        
+        // Load settings from global state
+        const savedSettings = this._context.globalState.get<ChatSettings>('chatSettings');
+        if (savedSettings) {
+            this._settings = savedSettings;
+        }
+        
         await this._loadSessions();
+        
+        // Register for configuration changes
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('aiChat.apiBaseUrl')) {
+                const config = vscode.workspace.getConfiguration('aiChat');
+                API_BASE_URL = config.get('apiBaseUrl') as string;
+            }
+        });
     }
 
     private async _loadSessions(): Promise<void> {
@@ -123,9 +671,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }, 500);
     }
 
-    private async _getEnhancedContext(): Promise<CodeContext> {
+    private async _getEnhancedContext(): Promise<CodeContext | null> {
         const editor = vscode.window.activeTextEditor;
-        if (!editor) return Promise.resolve(null as CodeContext);
+        if (!editor) return null;
 
         const document = editor.document;
         const selection = editor.selection;
@@ -155,7 +703,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             case 'generateTest':
                 prompt = `Generate a test case for this ${context.language} code:\n\n${context.selection || context.code}\n\nInclude assertions for data validation.`;
                 break;
-            // Add other cases...
+            case 'optimizeCode':
+                prompt = `Optimize this ${context.language} code for better performance:\n\n${context.selection || context.code}`;
+                break;
+            case 'documentCode':
+                prompt = `Add comprehensive documentation to this ${context.language} code:\n\n${context.selection || context.code}`;
+                break;
+            case 'refactorCode':
+                prompt = `Refactor this ${context.language} code to improve readability:\n\n${context.selection || context.code}`;
+                break;
         }
 
         if (prompt) {
@@ -165,7 +721,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     
     private _setWebviewMessageListener(webviewView: vscode.WebviewView): void {
         webviewView.webview.onDidReceiveMessage(async (message) => {
-            console.log('Received message:', message);  // Added for debugging
+            console.log('Received message:', message.command);  // Added for debugging
             
             switch (message.command) {
                 case 'sendMessage':
@@ -207,6 +763,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'stopResponse':
                     this._stopBotResponse();
                     break;
+                case 'showCodeDiff':
+                    await this._showCodeDiff(message.code);
+                    break;
+                case 'webviewReady':
+                    this._updateWebview();
+                    break;
             }
         });
     }
@@ -234,7 +796,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 title: 'New Chat',
                 messages: [],
                 model: this._settings.defaultModel,
-                contextFiles: await this._getCurrentContextFiles(),
+                contextFiles: this._settings.autoContext ? await this._getCurrentContextFiles() : [],
                 timestamp: Date.now()
             };
     
@@ -383,24 +945,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const signal = this._abortController.signal;
         
         try {
-            const response = await fetch(`${API_BASE_URL}/chat/stream`, {
+            // API call remains the same
+            const response = await fetch(`${API_BASE_URL}/v1/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     message: userMessage,
-                    model: session.model,
-                    context: this._settings.autoContext ? session.contextFiles : []
+                    context: this._settings.autoContext && session.contextFiles.length > 0 ? {
+                        file_path: session.contextFiles[0].path,
+                        code: session.contextFiles[0].content,
+                        language: session.contextFiles[0].language || 'text',
+                        selection: ''
+                    } : {},
+                    model: session.model
                 }),
                 signal
             });
     
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
     
-            const reader = Readable.toWeb(response.body as Readable).getReader();
+            const reader = Readable.toWeb(response.body as any).getReader();
             if (!reader) throw new Error('Failed to get response reader');
             
             const decoder = new TextDecoder();
             let fullResponse = '';
+            
+            // Find the bot message in the session
+            const botMsg = session.messages.find(m => m.id === botMessageId);
+            if (!botMsg) throw new Error('Bot message not found');
             
             while (true) {
                 const { done, value } = await reader.read();
@@ -410,19 +982,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 const chunk = decoder.decode(value, { stream: true });
                 fullResponse += chunk;
                 
-                const botMsg = session.messages.find(m => m.id === botMessageId);
                 if (botMsg) {
                     const processed = this._processBotResponse(fullResponse);
                     botMsg.content = processed.content;
                     botMsg.codeSuggestion = processed.codeSuggestion;
                     botMsg.codeLanguage = processed.codeLanguage;
                     
-                    this._updateWebview();
+                    // Instead of updating the entire webview, only update the streaming message
+                    this._updateStreamingMessage(botMessageId, botMsg);
                 }
             }
             
             // Process final response
-            const botMsg = session.messages.find(m => m.id === botMessageId);
             if (botMsg) {
                 const processed = this._processBotResponse(fullResponse);
                 botMsg.content = processed.content;
@@ -433,27 +1004,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 if (botMsg.codeSuggestion) {
                     await this._showCodeDiff(botMsg.codeSuggestion);
                 }
+                
+                // Update the entire webview once at the end
+                this._updateWebview();
             }
         } finally {
             this._abortController = undefined;
         }
     }
+
+    // New method to update only the streaming message content
+    private _updateStreamingMessage(messageId: string, message: ChatMessage): void {
+        if (!this._view) return;
+    
+        try {
+            this._view.webview.postMessage({
+                command: 'updateStreamingMessage',
+                messageId: messageId,
+                content: message.content,
+                codeSuggestion: message.codeSuggestion,
+                codeLanguage: message.codeLanguage
+            });
+        } catch (error) {
+            console.error('Error updating streaming message:', error);
+        }
+    }
     
     private async _fetchBotResponse(session: ChatSession, botMessageId: string, userMessage: string): Promise<void> {
-        const response = await fetch(`${API_BASE_URL}/chat`, {
+        // Modified to match API in main.py
+        const response = await fetch(`${API_BASE_URL}/v1/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+                // messages: session.messages.filter(m => !m.isStreaming).map(m => ({
+                //     role: m.isBot ? 'assistant' : 'user',
+                //     content: m.content
+                // })),
+                // model: session.model,
+                // context: this._settings.autoContext ? session.contextFiles : []
                 message: userMessage,
-                model: session.model,
-                context: this._settings.autoContext ? session.contextFiles : []
+                context: this._settings.autoContext && session.contextFiles.length > 0 ? {
+                    file_path: session.contextFiles[0].path,
+                    code: session.contextFiles[0].content,
+                    language: session.contextFiles[0].language || 'text',
+                    selection: '' // Add selection if available
+                } : {},
+                model: session.model
             })
         });
 
         if (!response.ok) throw new Error(`API Error: ${response.status}`);
 
-        const data = await response.json();
-        const botResponse = this._processBotResponse(data.response);
+        // Read the streaming response and collect all chunks
+        const reader = Readable.toWeb(response.body as any).getReader();
+        if (!reader) throw new Error('Failed to get response reader');
+        
+        const decoder = new TextDecoder();
+        let fullResponse = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            fullResponse += decoder.decode(value, { stream: true });
+        }
+        
+        const botResponse = this._processBotResponse(fullResponse);
 
         const botMsg = session.messages.find(m => m.id === botMessageId);
         if (botMsg) {
@@ -480,24 +1095,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         codeSuggestion?: string;
         codeLanguage?: string;
     } {
-        const processed = marked.parse(response, {
-            highlight: (code, lang) => {
-                if (lang && hljs.getLanguage(lang)) {
-                    return hljs.highlight(lang, code).value;
-                } else {
-                    return hljs.highlightAuto(code).value;
+        // With the dummy API, we'll get random text - try to make it look presentable
+        try {
+            // Process as markdown
+            marked.use(markedHighlight({
+                highlight(code: string, lang: string | undefined): string {
+                    if (lang && hljs.getLanguage(lang)) {
+                        return hljs.highlight(code, { language: lang }).value;
+                    } else {
+                        return hljs.highlightAuto(code).value;
+                    }
                 }
-            }
-        });
-    
-        // Improved code extraction - get language too
-        const codeMatch = processed.match(/<pre><code class="language-([a-zA-Z0-9]+)">([\s\S]*?)<\/code><\/pre>/);
+            }));
+            
+            const processed = marked.parse(response);
         
-        return {
-            content: codeMatch ? processed.replace(codeMatch[0], '') : processed,
-            codeSuggestion: codeMatch?.[2],
-            codeLanguage: codeMatch?.[1]
-        };
+            // Look for code blocks in the response
+            const codeMatch = response.match(/```([a-zA-Z0-9]+)?\s*([\s\S]*?)```/);
+            
+            return {
+                content: codeMatch ? processed.replace(codeMatch[0], '') : processed,
+                codeSuggestion: codeMatch?.[2],
+                codeLanguage: codeMatch?.[1] || 'text'
+            };
+        } catch (error) {
+            console.error('Error processing bot response:', error);
+            return {
+                content: response
+            };
+        }
     }
 
     private async _showCodeDiff(suggestion: string): Promise<void> {
@@ -776,6 +1402,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         toggleSettings();
                     });
                     
+                    document.getElementById('attachContext').addEventListener('click', () => {
+                        console.log('Attach context button clicked');
+                        vscode.postMessage({ command: 'addContextFile' });
+                    });
+                    
+                    document.getElementById('clearContext').addEventListener('click', () => {
+                        console.log('Clear context button clicked');
+                        if (currentSessionId) {
+                            const session = sessions.find(s => s.id === currentSessionId);
+                            if (session && session.contextFiles.length > 0) {
+                                session.contextFiles.forEach(file => {
+                                    vscode.postMessage({ 
+                                        command: 'removeContextFile', 
+                                        filePath: file.path 
+                                    });
+                                });
+                            }
+                        }
+                    });
+                    
                     modelSelect.addEventListener('change', () => {
                         console.log('Model changed to:', modelSelect.value);
                         vscode.postMessage({ 
@@ -803,6 +1449,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         switch (message.command) {
                             case 'updateChat':
                                 updateUI(message);
+                                break;
+                            case 'updateStreamingMessage':
+                                updateStreamingMessageContent(message);
                                 break;
                             case 'showError':
                                 showToast(message.message, 'error');
@@ -890,6 +1539,103 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         updateContextFiles(data.currentSession?.contextFiles || []);
                         
                         currentSessionTitle.textContent = data.currentSession?.title || 'AI Chat';
+                    }
+
+                    function updateStreamingMessageContent(data) {
+                        const messageElement = document.querySelector(\`[data-message-id="\${data.messageId}"]\`);
+                        if (!messageElement) return;
+                        
+                        // Update the message content
+                        const contentElement = messageElement.querySelector('.message-content');
+                        if (contentElement) {
+                            contentElement.innerHTML = data.content || '';
+                        }
+                        
+                        // Handle code suggestion if present
+                        const existingCodeBlock = messageElement.querySelector('.code-block');
+                        if (data.codeSuggestion) {
+                            if (existingCodeBlock) {
+                                // Update existing code block
+                                const codeElement = existingCodeBlock.querySelector('code');
+                                if (codeElement) {
+                                    codeElement.textContent = data.codeSuggestion;
+                                    codeElement.className = \`language-\${data.codeLanguage || ''}\`;
+                                }
+                                
+                                // Update language tag
+                                const langTag = existingCodeBlock.querySelector('.language-tag');
+                                if (langTag) {
+                                    langTag.textContent = data.codeLanguage || 'code';
+                                }
+                            } else {
+                                // Create new code block if it doesn't exist yet
+                                const codeBlockHtml = \`
+                                    <div class="code-block">
+                                        <div class="code-header">
+                                            <span class="language-tag">\${data.codeLanguage || 'code'}</span>
+                                            <button class="copy-button" title="Copy to clipboard">
+                                                <span class="codicon codicon-copy"></span>
+                                            </button>
+                                        </div>
+                                        <pre><code class="language-\${data.codeLanguage || ''}">\${escapeHtml(data.codeSuggestion)}</code></pre>
+                                        <div class="code-actions">
+                                            <button class="code-action-button apply-code" title="Apply to editor">
+                                                <span class="codicon codicon-check"></span>
+                                                Apply
+                                            </button>
+                                            <button class="code-action-button view-diff" title="View differences">
+                                                <span class="codicon codicon-git-compare"></span>
+                                                Compare
+                                            </button>
+                                        </div>
+                                    </div>
+                                \`;
+                                
+                                const tempDiv = document.createElement('div');
+                                tempDiv.innerHTML = codeBlockHtml;
+                                messageElement.appendChild(tempDiv.firstChild);
+                                
+                                // Add event listeners to the newly created buttons
+                                const copyBtn = messageElement.querySelector('.copy-button');
+                                if (copyBtn) {
+                                    copyBtn.addEventListener('click', (e) => {
+                                        const codeBlock = e.target.closest('.code-block');
+                                        const code = codeBlock.querySelector('code').textContent;
+                                        
+                                        navigator.clipboard.writeText(code).then(() => {
+                                            const originalIcon = copyBtn.innerHTML;
+                                            copyBtn.innerHTML = '<span class="codicon codicon-check"></span>';
+                                            
+                                            setTimeout(() => {
+                                                copyBtn.innerHTML = originalIcon;
+                                            }, 2000);
+                                        });
+                                    });
+                                }
+                                
+                                const applyBtn = messageElement.querySelector('.apply-code');
+                                if (applyBtn) {
+                                    applyBtn.addEventListener('click', () => {
+                                        vscode.postMessage({
+                                            command: 'applyCodeSuggestion',
+                                            code: data.codeSuggestion
+                                        });
+                                        
+                                        showToast('Code applied to editor', 'success');
+                                    });
+                                }
+                                
+                                const diffBtn = messageElement.querySelector('.view-diff');
+                                if (diffBtn) {
+                                    diffBtn.addEventListener('click', () => {
+                                        vscode.postMessage({
+                                            command: 'showCodeDiff',
+                                            code: data.codeSuggestion
+                                        });
+                                    });
+                                }
+                            }
+                        }
                     }
 
                     function updateSessionList(sessions, currentId) {
@@ -1040,7 +1786,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 currentGroup.push(msg);
                             }
                         });
-                        
+
                         if (currentGroup.length > 0) messageGroups.push(currentGroup);
                         
                         // Generate HTML for message groups
@@ -1260,57 +2006,329 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 }
 
-export function activate(context: vscode.ExtensionContext) {
-    const provider = new ChatViewProvider(context, context.extensionUri);
+class AIInlineCompletionProvider implements vscode.InlineCompletionItemProvider {
+    private lastRequestTime: number = 0;
+    private completionDebounceTimeout: NodeJS.Timeout | undefined;
+    private isRequestInProgress: boolean = false;
     
-    // Register completion provider
-    class AIChatCompletionProvider implements vscode.CompletionItemProvider {
-        async provideCompletionItems(document: vscode.TextDocument, position: vscode.Position) {
-            try {
-                const response = await fetch('http://127.0.0.1:5000/generate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        code: document.getText(),
-                        line: position.line,
-                        character: position.character
-                    })
-                });
-                
-                const data = await response.json();
-                return data.suggestions.map((suggestion: string) => 
-                    new vscode.CompletionItem(suggestion, vscode.CompletionItemKind.Snippet));
-            } catch (error) {
-                console.error('Completion error:', error);
-                return [];
+    async provideInlineCompletionItems(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        context: vscode.InlineCompletionContext,
+        token: vscode.CancellationToken
+    ): Promise<vscode.InlineCompletionItem[] | null> {
+        // Don't trigger completions too frequently or if a request is already in progress
+        const now = Date.now();
+        if (now - this.lastRequestTime < 500 || this.isRequestInProgress) {
+            return null;
+        }
+        
+        this.lastRequestTime = now;
+        this.isRequestInProgress = true;
+        
+        try {
+            // Get the file content and cursor position
+            const fileText = document.getText();
+            const filePath = document.uri.fsPath;
+            
+            // Get text leading up to cursor for prompt context
+            const textUpToCursor = document.getText(new vscode.Range(
+                new vscode.Position(0, 0),
+                position
+            ));
+            
+            // Make API call to your backend
+            const response = await fetch(`${API_BASE_URL}/v1/complete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    prompt: textUpToCursor,
+                    file_path: filePath,
+                    max_tokens: 256
+                })
+            });
+            
+            if (!response.ok) {
+                console.error(`API error: ${response.status}`);
+                return null;
             }
+            
+            // Process streaming response
+            const reader = Readable.toWeb(response.body as any).getReader();
+            if (!reader) return null;
+            
+            const decoder = new TextDecoder();
+            let fullResponse = '';
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                fullResponse += decoder.decode(value, { stream: true });
+                if (token.isCancellationRequested) {
+                    return null;
+                }
+            }
+            
+            // Create inline completion items
+            const completions: vscode.InlineCompletionItem[] = [];
+            const suggestions = fullResponse.trim().split('\n');
+            
+            for (const suggestion of suggestions) {
+                if (!suggestion.trim()) continue;
+                
+                // Create an inline completion item with the suggestion text
+                const item = new vscode.InlineCompletionItem(
+                    suggestion,
+                    new vscode.Range(position, position)
+                );
+                
+                // Add command for when the completion is accepted
+                item.command = {
+                    command: 'diplugin.logCompletionAccepted',
+                    title: 'Completion Accepted'
+                };
+                
+                completions.push(item);
+            }
+            
+            return completions;
+        } catch (error) {
+            console.error('Inline completion provider error:', error);
+            return null;
+        } finally {
+            this.isRequestInProgress = false;
         }
     }
+    
+    setupAutoTrigger() {
+        const settings = getCompletionSettings();
+        if (!settings.autoTrigger) {
+            return; // Don't auto trigger if disabled
+        }
+        // Listen for document changes
+        vscode.workspace.onDidChangeTextDocument(event => {
+            // Skip triggering for large changes (like file load)
+            if (event.contentChanges.length === 0 || 
+                event.contentChanges.some(change => change.text.length > 100)) {
+                return;
+            }
+            
+            // Only trigger for typing events (not bulk edits)
+            const isTypingEvent = event.contentChanges.length === 1 && 
+                                 event.contentChanges[0].text.length <= 1;
+            
+            if (!isTypingEvent) {
+                return;
+            }
+        
+            // Update settings in real-time
+            const currentSettings = getCompletionSettings();
+            if (!currentSettings.enabled || !currentSettings.autoTrigger) {
+                return;
+            }
+            
+            // Clear existing timeout
+            if (this.completionDebounceTimeout) {
+                clearTimeout(this.completionDebounceTimeout);
+            }
+            
+            // Schedule inline completion trigger after delay
+            this.completionDebounceTimeout = setTimeout(() => {
+                vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+            }, currentSettings.delay);
+        });
+    
+        // Also listen for configuration changes
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('aiChat')) {
+                // Settings changed, potentially update behavior
+                const settings = getCompletionSettings();
+                if (!settings.enabled) {
+                    // Clear any pending triggers
+                    if (this.completionDebounceTimeout) {
+                        clearTimeout(this.completionDebounceTimeout);
+                        this.completionDebounceTimeout = undefined;
+                    }
+                }
+            }
+        });
+    }
+}
 
-    // Register commands and providers
+export function activate(context: vscode.ExtensionContext) {
+    console.log('Extension "diplugin" is now active!');
+    
+    // Load API config from VSCode settings
+    const config = vscode.workspace.getConfiguration('aiChat');
+    if (config.has('apiBaseUrl')) {
+        API_BASE_URL = config.get('apiBaseUrl') as string;
+    }
+    
+    const provider = new ChatViewProvider(context, context.extensionUri);
+    
+    // Initialize the code refactoring provider
+    const refactoringProvider = new CodeRefactoringProvider(context);
+    
+    // Register chat view provider
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider),
+        vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider)
+    );
+    
+    // Register the refactor command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diplugin.refactorCode', async () => {
+            await refactoringProvider.refactorSelectedCode();
+        }),
         vscode.commands.registerCommand('diplugin.focusChat', async () => {
             await vscode.commands.executeCommand('workbench.view.extension.diplugin-sidebar');
-            await vscode.commands.executeCommand('workbench.action.focusView');
         }),
-        vscode.commands.registerCommand('diplugin.newChat', async () => {
-            await vscode.commands.executeCommand('workbench.view.extension.diplugin-sidebar');
-            await vscode.commands.executeCommand('diplugin.focusChat');
-        }),
-        vscode.languages.registerCompletionItemProvider(
-            ['javascript', 'python', 'typescript'],
-            new AIChatCompletionProvider(),
-            '.', '"', "'", ' ', '('
-        )
+        vscode.commands.registerCommand('diplugin.askAi', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                vscode.window.showInformationMessage('No active editor');
+                return;
+            }
+        
+            const selection = editor.selection;
+            const selectedText = editor.document.getText(selection);
+        
+            const prompt = selectedText || await vscode.window.showInputBox({ 
+                prompt: 'Enter your prompt for the AI' 
+            });
+            
+            if (!prompt) {
+                vscode.window.showInformationMessage('No prompt provided');
+                return;
+            }
+        
+            try {
+                const response = await axios.post(`${API_BASE_URL}/v1/complete`, {
+                    prompt,
+                    file_path: editor.document.uri.fsPath,
+                    max_tokens: 512
+                });
+        
+                const aiResponse = response.data || 'No response received from AI.';
+        
+                const doc = await vscode.workspace.openTextDocument({ 
+                    content: aiResponse, 
+                    language: 'markdown' 
+                });
+                await vscode.window.showTextDocument(doc);
+            } catch (error) {
+                if (axios.isAxiosError(error)) {
+                    vscode.window.showErrorMessage(`API error: ${error.message}`);
+                } else {
+                    vscode.window.showErrorMessage(`Unexpected error: ${String(error)}`);
+                }
+            }
+        })
     );
-
-    // Status bar item
-    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    
+    // Create status bar item for quick access
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     statusBarItem.text = "$(comment-discussion) AI Chat";
     statusBarItem.tooltip = "Open AI Chat";
     statusBarItem.command = "diplugin.focusChat";
     statusBarItem.show();
+    
+    context.subscriptions.push(statusBarItem);
+    
+    // Register the inline completion provider
+    const inlineCompletionProvider = new AIInlineCompletionProvider();
+    context.subscriptions.push(
+        vscode.languages.registerInlineCompletionItemProvider(
+            { pattern: '**' },  // All files
+            inlineCompletionProvider
+        )
+    );
+    
+    // Track completion acceptance
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diplugin.logCompletionAccepted', () => {
+            // You can add analytics or other processing when a completion is accepted
+            console.log('Completion was accepted');
+        })
+    );
+    
+    // Set up auto-triggering for inline completions
+    inlineCompletionProvider.setupAutoTrigger();
+
+    configureEditorSettings();
+
+    // Register commands and providers
+    // context.subscriptions.push(
+    //     vscode.commands.registerCommand('diplugin.refactorCode', async () => {
+    //         const provider = new ChatViewProvider(context, context.extensionUri);
+    //         await provider._handleCodeAction('refactorCode');
+    //     }),
+    //     vscode.commands.registerCommand('diplugin.explainCode', async () => {
+    //         const provider = new ChatViewProvider(context, context.extensionUri);
+    //         await provider._handleCodeAction('explainCode');
+    //     })
+    // );
+    // context.subscriptions.push(disposable);
+
+    
 }
 
-export function deactivate() {}
+export function deactivate() {
+    // Clean up resources when extension is deactivated
+    console.log('Extension "diplugin" is now deactivated.');
+}
+
+function getCompletionSettings(): AICompletionSettings {
+    const config = vscode.workspace.getConfiguration('aiChat');
+    return {
+        enabled: config.get<boolean>('enableInlineCompletions', true),
+        delay: config.get<number>('inlineCompletionDelay', 500),
+        autoTrigger: config.get<boolean>('autoTriggerCompletions', true)
+    };
+}
+
+async function configureEditorSettings() {
+    // Only suggest changing settings if they're not already set
+    const editorConfig = vscode.workspace.getConfiguration('editor');
+    
+    // Enable inline suggestions if not already enabled
+    if (editorConfig.get('inlineSuggest.enabled') === false) {
+        const updateSetting = await vscode.window.showInformationMessage(
+            'For the best AI completion experience, it\'s recommended to enable "editor.inlineSuggest.enabled". ' +
+            'Would you like to enable this setting?',
+            'Yes', 'No'
+        );
+        
+        if (updateSetting === 'Yes') {
+            await editorConfig.update('inlineSuggest.enabled', true, vscode.ConfigurationTarget.Global);
+        }
+    }
+    
+    // Suggest setting up keybindings for accepting/rejecting inline suggestions
+    const keyboardConfig = vscode.workspace.getConfiguration('keyboard');
+    if (!keyboardConfig.get('acceptSuggestionOnEnter')) {
+        const updateKeybinding = await vscode.window.showInformationMessage(
+            'Would you like to configure keyboard shortcuts for accepting (Tab) and dismissing (Escape) AI suggestions?',
+            'Yes', 'No'
+        );
+        
+        if (updateKeybinding === 'Yes') {
+            // Open the keybindings.json file
+            await vscode.commands.executeCommand('workbench.action.openGlobalKeybindingsFile');
+            
+            // Suggest keybindings to add
+            const msg = vscode.window.showInformationMessage(
+                'Add these entries to your keybindings.json file:\n\n' +
+                '{\n' +
+                '    "key": "tab",\n' +
+                '    "command": "editor.action.inlineSuggest.commit",\n' +
+                '    "when": "inlineSuggestionVisible && !editorTabMovesFocus"\n' +
+                '},\n' +
+                '{\n' +
+                '    "key": "escape",\n' +
+                '    "command": "editor.action.inlineSuggest.hide",\n' +
+                '    "when": "inlineSuggestionVisible"\n' +
+                '}'
+            );
+        }
+    }
+}
