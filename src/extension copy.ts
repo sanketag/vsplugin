@@ -11,9 +11,9 @@ import python from 'highlight.js/lib/languages/python';
 import json from 'highlight.js/lib/languages/json';
 import xml from 'highlight.js/lib/languages/xml';
 import css from 'highlight.js/lib/languages/css';
-import * as path from 'path';
 import axios from 'axios';
 import { diffLines } from 'diff'
+import { TextDecoder } from 'util';
 
 // Register common languages for syntax highlighting
 hljs.registerLanguage('javascript', javascript);
@@ -76,107 +76,92 @@ export class CodeRefactoringProvider {
     private _context: vscode.ExtensionContext;
     private _statusBarItem: vscode.StatusBarItem;
     private _abortController?: AbortController;
-    private _decoration: vscode.TextEditorDecorationType;
-    private _addedLineDecoration: vscode.TextEditorDecorationType;
-    private _removedLineDecoration: vscode.TextEditorDecorationType;
-    private _inlineRefactoringPanel?: vscode.WebviewPanel;
+    private _selectionDecoration: vscode.TextEditorDecorationType;
+    private _hoverProviderDisposable?: vscode.Disposable;
+    private _currentSelection?: vscode.Selection;
+    private _addedDecoration: vscode.TextEditorDecorationType;
+    private _removedDecoration: vscode.TextEditorDecorationType;
     private _isRefactoringInProgress: boolean = false;
+    private _currentRefactoring?: {
+        original: string;
+        refactored: string;
+        selection: vscode.Selection;
+        addedRange?: vscode.Range;
+    };
+    private _acceptRejectDecoration?: vscode.TextEditorDecorationType;
+    private _webviewPanel?: vscode.WebviewPanel;
 
     constructor(context: vscode.ExtensionContext) {
         this._context = context;
         
-        // Create status bar item for showing refactoring status
         this._statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
         this._context.subscriptions.push(this._statusBarItem);
         
-        // Initialize decoration types for highlighting changes
-        this._decoration = vscode.window.createTextEditorDecorationType({
-            border: '1px solid #888',
-            backgroundColor: 'rgba(100, 100, 255, 0.1)'
+        // Decoration for selected code
+        this._selectionDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(100, 100, 255, 0.1)',
+            border: '1px solid rgba(100, 100, 255, 0.5)'
         });
-        
-        this._addedLineDecoration = vscode.window.createTextEditorDecorationType({
-            backgroundColor: 'rgba(80, 200, 80, 0.2)',
-            isWholeLine: true,
-            before: {
-                contentText: '+ ',
-                color: 'green'
-            }
+
+        // Decoration for added lines
+        this._addedDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(155, 185, 85, 0.2)',
+            border: '1px solid rgba(155, 185, 85, 0.5)'
         });
-        
-        this._removedLineDecoration = vscode.window.createTextEditorDecorationType({
+
+        // Decoration for removed lines
+        this._removedDecoration = vscode.window.createTextEditorDecorationType({
             backgroundColor: 'rgba(255, 100, 100, 0.2)',
-            isWholeLine: true,
-            before: {
-                contentText: '- ',
-                color: 'red'
-            }
+            border: '1px solid rgba(255, 100, 100, 0.5)',
+            textDecoration: 'line-through'
         });
+
+        // Decoration for accept/reject buttons
+        this._acceptRejectDecoration = vscode.window.createTextEditorDecorationType({
+            after: {
+                margin: '0 0 0 1em',
+                fontWeight: 'normal',
+            },
+            rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen
+        });
+
+        this.registerHoverProvider();
         
-        // Load initial configuration
-        const config = vscode.workspace.getConfiguration('aiChat');
-        if (config.has('apiBaseUrl')) {
-            API_BASE_URL = config.get('apiBaseUrl') as string;
-        }
-        
-        // Register commands for accepting/rejecting refactoring
         this._context.subscriptions.push(
             vscode.commands.registerCommand('diplugin.acceptRefactoring', () => this._handleAcceptRefactoring()),
-            vscode.commands.registerCommand('diplugin.rejectRefactoring', () => this._handleRejectRefactoring())
+            vscode.commands.registerCommand('diplugin.rejectRefactoring', () => this._handleRejectRefactoring()),
+            vscode.commands.registerCommand('diplugin.refactorCode', () => this.refactorSelectedCode())
+        );
+
+        this._context.subscriptions.push(
+            vscode.window.onDidChangeTextEditorSelection(() => {
+                if (this._isRefactoringInProgress || this._awaitingUserDecision) {
+                    this._cleanupRefactoring();
+                }
+            })
         );
     }
 
-    public async refactorSelectedCode(): Promise<void> {
-        // Check if refactoring is already in progress
-        if (this._isRefactoringInProgress) {
-            vscode.window.showInformationMessage('A refactoring operation is already in progress');
-            return;
-        }
-        
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            vscode.window.showInformationMessage('No active editor');
-            return;
-        }
+    private registerHoverProvider(): void {
+        this._hoverProviderDisposable = vscode.languages.registerHoverProvider('*', {
+            provideHover: (document, position) => {
+                const editor = vscode.window.activeTextEditor;
+                if (!editor || !editor.selection.contains(position) || editor.selection.isEmpty) {
+                    return null;
+                }
 
-        const selection = editor.selection;
-        if (selection.isEmpty) {
-            vscode.window.showInformationMessage('No code selected for refactoring');
-            return;
-        }
+                this._currentSelection = editor.selection;
+                const content = new vscode.MarkdownString();
+                content.appendMarkdown(`[Refactor Code](command:diplugin.refactorCode)`);
+                content.isTrusted = true;
 
-        const selectedCode = editor.document.getText(selection);
-        const targetVersion = await this._promptForTargetVersion();
-        if (!targetVersion) return; // User cancelled
-
-        this._isRefactoringInProgress = true;
-        this._showRefactoringStatus('$(sync~spin) Refactoring...');
-        
-        try {
-            const refactoredCode = await this._callRefactorApi(selectedCode, targetVersion);
-            if (refactoredCode) {
-                await this._showInlineRefactorPreview(selectedCode, refactoredCode, selection);
+                return new vscode.Hover(content);
             }
-        } catch (error) {
-            this._hideRefactoringStatus();
-            this._isRefactoringInProgress = false;
-            if (error instanceof Error) {
-                vscode.window.showErrorMessage(`Refactoring failed: ${error.message}`);
-            } else {
-                vscode.window.showErrorMessage('Refactoring failed with an unknown error');
-            }
-        }
-    }
-
-    private async _promptForTargetVersion(): Promise<string | undefined> {
-        const versions = ['airflow2.6', 'airflow2.5', 'airflow2.4', 'airflow2.0'];
-        return vscode.window.showQuickPick(versions, {
-            placeHolder: 'Select target Airflow version',
-            title: 'Refactor Code'
         });
+        this._context.subscriptions.push(this._hoverProviderDisposable);
     }
 
-    private async _callRefactorApi(code: string, targetVersion: string): Promise<string> {
+    private async _fetchRefactorApi(code: string): Promise<string> {
         this._abortController = new AbortController();
         const signal = this._abortController.signal;
         
@@ -184,382 +169,332 @@ export class CodeRefactoringProvider {
             const response = await fetch(`${API_BASE_URL}/v1/refactor`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    code: code,
-                    target_version: targetVersion
-                }),
+                body: JSON.stringify({ code }),
                 signal
             });
     
             if (!response.ok) {
-                throw new Error(`API Error: ${response.status}`);
+                throw new Error(`API Error: ${response.status} ${response.statusText}`);
             }
     
-            // Handle streaming response
-            const reader = Readable.toWeb(response.body as any).getReader();
-            if (!reader) {
-                throw new Error('Failed to get response reader');
+            const data = await response.json();
+            
+            if (!data.refactored) {
+                throw new Error('Invalid response format from refactoring API');
             }
-            
-            const decoder = new TextDecoder();
-            let fullResponse = '';
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                
-                const chunk = decoder.decode(value, { stream: true });
-                fullResponse += chunk;
-            }
-            
-            return fullResponse;
+    
+            return data.refactored;
+        } catch (error) {
+            console.error('Refactoring error:', error);
+            throw error;
         } finally {
             this._abortController = undefined;
         }
     }
     
-    private _currentDecorations?: {
-        preview: vscode.TextEditorDecorationType;
-        codelens: vscode.Disposable;
-        timeout: NodeJS.Timeout;
-    };
+    private _awaitingUserDecision: boolean = false;
 
-    private async _showInlineRefactorPreview(originalCode: string, refactoredCode: string, selection: vscode.Selection): Promise<void> {
+    private async refactorSelectedCode(): Promise<void> {
+        if (this._isRefactoringInProgress || this._awaitingUserDecision) {
+            vscode.window.showInformationMessage('Complete the current refactoring first');
+            return;
+        }
+        
         const editor = vscode.window.activeTextEditor;
-        if (!editor) return;
+        if (!editor || !this._currentSelection || this._currentSelection.isEmpty) {
+            vscode.window.showInformationMessage('No code selected for refactoring');
+            return;
+        }
+    
+        const selectedCode = editor.document.getText(this._currentSelection);
+        this._isRefactoringInProgress = true;
+        this._showRefactoringStatus('$(sync~spin) Refactoring...');
         
-        // Calculate the diff
-        const changes = diffLines(originalCode, refactoredCode);
-        
-        // Clear any existing decorations
-        editor.setDecorations(this._decoration, []);
-        
-        // Create decoration for the inline preview
-        const inlinePreviewDecoration = vscode.window.createTextEditorDecorationType({
-            after: {
-                contentText: this._getInlinePreviewText(changes),
-                margin: '10px 0 0 0',
-                border: '1px solid var(--vscode-panel-border)',
-                backgroundColor: 'var(--vscode-editor-background)',
-                width: 'max-content',
-                height: 'max-content',
-                color: 'var(--vscode-editor-foreground)'
-            },
-            isWholeLine: true
-        });
-        
-        // Apply decoration at the start of selection
-        const decorationRange = new vscode.Range(
-            selection.start.line, 0,
-            selection.start.line, 0
-        );
-        
-        editor.setDecorations(inlinePreviewDecoration, [decorationRange]);
-        
-        // Apply diff decorations to highlight changes in the editor
-        this._applyDiffDecorations(editor, selection, originalCode, refactoredCode);
-        
-        this._hideRefactoringStatus();
-        
-        // Create buttons for accept/reject using Codelens
-        const acceptCodeLensProvider: vscode.CodeLensProvider = {
-            provideCodeLenses: (document: vscode.TextDocument) => {
-                if (document.uri.toString() !== editor.document.uri.toString()) return [];
-                
-                const range = new vscode.Range(selection.start.line, 0, selection.start.line, 0);
-                
-                const acceptLens = new vscode.CodeLens(range, {
-                    title: '✓ Accept',
-                    command: 'diplugin.acceptRefactoring',
-                    arguments: [refactoredCode, selection]
-                });
-                
-                const rejectLens = new vscode.CodeLens(range, {
-                    title: '✗ Reject',
-                    command: 'diplugin.rejectRefactoring',
-                    arguments: []
-                });
-                
-                return [acceptLens, rejectLens];
-            }
-        };
-        
-        // Register the codelens provider temporarily
-        const codeLensDisposable = vscode.languages.registerCodeLensProvider(
-            { pattern: editor.document.uri.fsPath },
-            acceptCodeLensProvider
-        );
-        
-        // Set a timer to remove decorations if user doesn't interact
-        const decorationTimeout = setTimeout(() => {
-            inlinePreviewDecoration.dispose();
-            editor.setDecorations(this._addedLineDecoration, []);
-            editor.setDecorations(this._removedLineDecoration, []);
-            codeLensDisposable.dispose();
+        try {
+            this._isRefactoringInProgress = true;
+            const refactoredCode = await this._fetchRefactorApi(selectedCode);
+            this._showInlineDiff(selectedCode, refactoredCode);
+            this._showPersistentButtons();
+            this._awaitingUserDecision = true;
+        } finally {
             this._isRefactoringInProgress = false;
-        }, 60000); // Remove after 1 minute of inactivity
-        
-        // Store these to dispose later
-        this._currentDecorations = {
-            preview: inlinePreviewDecoration,
-            codelens: codeLensDisposable,
-            timeout: decorationTimeout
-        };
-    }
-    
-    // Helper method to generate the text content for the inline preview
-    private _getInlinePreviewText(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
-        let previewText = 'Refactoring Preview:\n';
-        
-        changes.forEach(change => {
-            if (change.added) {
-                previewText += `+ ${change.value.trim()}\n`;
-            } else if (change.removed) {
-                previewText += `- ${change.value.trim()}\n`;
-            } else {
-                previewText += `  ${change.value.trim()}\n`;
-            }
-        });
-        
-        return previewText + '\n[Enter to Accept, Esc to Reject]';
-    }
-    
-    private _applyDiffDecorations(
-        editor: vscode.TextEditor, 
-        selection: vscode.Selection,
-        originalCode: string, 
-        refactoredCode: string
-    ): void {
-        const originalLines = originalCode.split('\n');
-        const refactoredLines = refactoredCode.split('\n');
-        
-        const changes = diffLines(originalCode, refactoredCode);
-        
-        const addedRanges: vscode.Range[] = [];
-        const removedRanges: vscode.Range[] = [];
-        
-        let lineOffset = selection.start.line;
-        let currentLine = 0;
-        
-        changes.forEach(change => {
-            const lineCount = change.value.split('\n').length - 1;
-            
-            if (change.added) {
-                // Highlight added lines in green
-                const startLine = lineOffset + currentLine;
-                const endLine = startLine + lineCount;
-                
-                for (let i = startLine; i <= endLine; i++) {
-                    const line = editor.document.lineAt(i);
-                    addedRanges.push(line.range);
-                }
-                
-                currentLine += lineCount;
-            } else if (change.removed) {
-                // Highlight removed lines in red
-                const startLine = lineOffset + currentLine;
-                const endLine = startLine + lineCount;
-                
-                for (let i = startLine; i <= endLine; i++) {
-                    if (i < editor.document.lineCount) {
-                        const line = editor.document.lineAt(i);
-                        removedRanges.push(line.range);
-                    }
-                }
-            } else {
-                // Unchanged lines
-                currentLine += lineCount;
-            }
-        });
-        
-        // Apply decorations
-        editor.setDecorations(this._addedLineDecoration, addedRanges);
-        editor.setDecorations(this._removedLineDecoration, removedRanges);
-    }
-
-    private _getInlinePreviewContent(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
-        const nonce = getNonce();
-        
-        return `
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline';">
-                <title>Code Refactor Preview</title>
-                <style>
-                    body {
-                        font-family: var(--vscode-editor-font-family, 'Segoe UI');
-                        font-size: var(--vscode-editor-font-size, 12px);
-                        padding: 0;
-                        margin: 0;
-                        background-color: var(--vscode-editor-background, #1e1e1e);
-                        color: var(--vscode-editor-foreground, #d4d4d4);
-                    }
-                    .container {
-                        display: flex;
-                        flex-direction: column;
-                        padding: 6px;
-                        max-height: 200px;
-                        overflow: auto;
-                    }
-                    .header {
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                        margin-bottom: 6px;
-                        user-select: none;
-                    }
-                    .title {
-                        font-weight: bold;
-                        font-size: 14px;
-                    }
-                    .actions {
-                        display: flex;
-                        gap: 8px;
-                    }
-                    button {
-                        padding: 4px 8px;
-                        background-color: var(--vscode-button-background, #0e639c);
-                        color: var(--vscode-button-foreground, white);
-                        border: none;
-                        border-radius: 2px;
-                        cursor: pointer;
-                    }
-                    button:hover {
-                        background-color: var(--vscode-button-hoverBackground, #1177bb);
-                    }
-                    .keyboard-shortcut {
-                        opacity: 0.7;
-                        margin-left: 4px;
-                        font-size: 10px;
-                    }
-                    
-                    /* Hides the preview panel when not needed, CSS only approach */
-                    .diffPreview {
-                        display: ${changes.length > 0 ? 'block' : 'none'};
-                        margin-top: 4px;
-                        max-height: 150px;
-                        overflow: auto;
-                        border: 1px solid var(--vscode-panel-border, #555);
-                        border-radius: 3px;
-                    }
-                    .line {
-                        padding: 1px 4px;
-                        font-family: var(--vscode-editor-font-family, monospace);
-                        white-space: pre;
-                    }
-                    .added {
-                        background-color: rgba(80, 200, 80, 0.2);
-                        color: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
-                    }
-                    .removed {
-                        background-color: rgba(255, 100, 100, 0.2);
-                        color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
-                    }
-                    .unchanged {
-                        color: var(--vscode-editor-foreground, #d4d4d4);
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <div class="title">Refactoring Preview</div>
-                        <div class="actions">
-                            <button id="reject">Reject <span class="keyboard-shortcut">(Esc)</span></button>
-                            <button id="accept">Accept <span class="keyboard-shortcut">(Enter)</span></button>
-                        </div>
-                    </div>
-                    
-                    <div class="diffPreview">
-                        ${changes.map(change => {
-                            const className = change.added ? 'added' : change.removed ? 'removed' : 'unchanged';
-                            const prefix = change.added ? '+ ' : change.removed ? '- ' : '  ';
-                            return `<div class="line ${className}">${prefix}${this._escapeHtml(change.value)}</div>`;
-                        }).join('')}
-                    </div>
-                </div>
-                
-                <script nonce="${nonce}">
-                    const vscode = acquireVsCodeApi();
-                    
-                    document.getElementById('accept').addEventListener('click', () => {
-                        vscode.postMessage({ command: 'accept' });
-                    });
-                    
-                    document.getElementById('reject').addEventListener('click', () => {
-                        vscode.postMessage({ command: 'reject' });
-                    });
-                    
-                    window.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter') {
-                            vscode.postMessage({ command: 'accept' });
-                            e.preventDefault();
-                        } else if (e.key === 'Escape' || e.key === 'Backspace') {
-                            vscode.postMessage({ command: 'reject' });
-                            e.preventDefault();
-                        }
-                    });
-                </script>
-            </body>
-            </html>
-        `;
-    }
-
-    private async _handleAcceptRefactoring(refactoredCode?: string, selection?: vscode.Selection): Promise<void> {
-        // Clean up decorations
-        if (this._currentDecorations) {
-            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
-            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
-            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
-            this._currentDecorations = undefined;
         }
+    }
+
+    private _showPersistentButtons(): void {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !this._currentSelection) return;
+    
+        // Create decoration for buttons
+        this._acceptRejectDecoration?.dispose();
+        this._acceptRejectDecoration = vscode.window.createTextEditorDecorationType({
+            rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+            after: {
+                contentText: "Accept | Reject",
+                backgroundColor: 'rgba(90, 90, 90, 0.3)',
+                color: 'var(--vscode-button-foreground)',
+                border: '1px solid var(--vscode-button-border)',
+                margin: '0 0 0 1em',
+                fontWeight: 'normal'
+            }
+        });
+    
+        // Add decoration at end of original selection
+        const range = new vscode.Range(
+            this._currentSelection.end,
+            this._currentSelection.end
+        );
+    
+        // Create clickable command links
+        const linkProvider = vscode.languages.registerDocumentLinkProvider({ scheme: 'file' }, {
+            provideDocumentLinks: () => [
+                new vscode.DocumentLink(
+                    range,
+                    vscode.Uri.parse('command:diplugin.acceptRefactoring')
+                ),
+                new vscode.DocumentLink(
+                    new vscode.Range(
+                        range.end.translate(0, 7),
+                        range.end.translate(0, 13)
+                    ),
+                    vscode.Uri.parse('command:diplugin.rejectRefactoring')
+                )
+            ]
+        });
+    
+        // Add hover styling
+        const hoverProvider = vscode.languages.registerHoverProvider('*', {
+            provideHover: (doc, pos) => {
+                if (range.contains(pos)) {
+                    const content = new vscode.MarkdownString();
+                    content.appendMarkdown("Click to accept or reject changes");
+                    return new vscode.Hover(content);
+                }
+            }
+        });
+    
+        // Store disposables
+        this._context.subscriptions.push(linkProvider, hoverProvider);
+        editor.setDecorations(this._acceptRejectDecoration, [{
+            range,
+            renderOptions: { after: {} }
+        }]);
+    }
+
+    private _showInlineDiff(originalCode: string, refactoredCode: string): void {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !this._currentSelection) return;
+    
+        // Only highlight the selection when starting
+        editor.setDecorations(this._selectionDecoration, [new vscode.Range(
+            this._currentSelection.start,
+            this._currentSelection.end
+        )]);
+    
+        // Do nothing further if refactored code is empty (initial state)
+        if (!refactoredCode) {
+            return;
+        }
+    
+        // Clear previous decorations
+        editor.setDecorations(this._addedDecoration, []);
+        editor.setDecorations(this._removedDecoration, []);
+    
+        // Mark the entire original selection as "removed"
+        const removedRange = new vscode.Range(
+            this._currentSelection.start,
+            this._currentSelection.end
+        );
+        editor.setDecorations(this._removedDecoration, [removedRange]);
+    
+        // Store the selection for future reference
+        const currentSelection = this._currentSelection;
+    
+        // We need to temporarily insert the refactored code to show it with green highlight
+        // We'll do this by getting the editor's document and making an edit
+        editor.edit(editBuilder => {
+            // Insert the refactored code right after the selection
+            editBuilder.insert(currentSelection.end, '\n\n' + refactoredCode);
+        }).then(() => {
+            // Calculate the range for the new code
+            const startPos = currentSelection.end.translate(2, 0); // Skip 2 lines (for the newlines we added)
+            const lines = refactoredCode.split('\n');
+            const endPos = startPos.translate(lines.length - 1, lines[lines.length - 1].length);
+            const addedRange = new vscode.Range(startPos, endPos);
+            
+            // Highlight the new code as "added"
+            editor.setDecorations(this._addedDecoration, [addedRange]);
+            
+            // Store the range information for later cleanup
+            this._currentRefactoring = {
+                original: originalCode,
+                refactored: refactoredCode,
+                selection: currentSelection,
+                addedRange: addedRange
+            };
+            
+            // Show accept/reject buttons
+            this._showAcceptRejectButtons();
+        });
+    }
+    
+    // In CodeRefactoringProvider class
+
+    private _showAcceptRejectButtons(): void {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !this._currentSelection) return;
+    
+        // Create decoration type for buttons
+        this._acceptRejectDecoration?.dispose();
+        this._acceptRejectDecoration = vscode.window.createTextEditorDecorationType({
+            after: {
+                margin: '0 0 0 1em',
+                fontWeight: 'normal',
+            },
+            rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen
+        });
+    
+        // Create document links for direct command execution
+        const linkProvider = vscode.languages.registerDocumentLinkProvider(
+            { scheme: 'file' },
+            {
+                provideDocumentLinks: () => {
+                    const endPos = this._currentSelection!.end;
+                    return [
+                        // Accept link
+                        new vscode.DocumentLink(
+                            new vscode.Range(endPos, endPos.translate(0, 6)),
+                            vscode.Uri.parse('command:diplugin.acceptRefactoring')
+                        ),
+                        // Reject link
+                        new vscode.DocumentLink(
+                            new vscode.Range(endPos.translate(0, 7), endPos.translate(0, 13)),
+                            vscode.Uri.parse('command:diplugin.rejectRefactoring')
+                        )
+                    ];
+                }
+            }
+        );
+    
+        // Add hover provider for visual feedback
+        const hoverProvider = vscode.languages.registerHoverProvider('*', {
+            provideHover: (document, position) => {
+                if (position.isEqual(this._currentSelection!.end)) {
+                    const content = new vscode.MarkdownString();
+                    content.appendMarkdown("**Accept** or **Reject** the refactoring");
+                    return new vscode.Hover(content);
+                }
+            }
+        });
+    
+        // Store disposables
+        this._context.subscriptions.push(linkProvider, hoverProvider);
+    
+        // Apply decoration
+        editor.setDecorations(this._acceptRejectDecoration, [{
+            range: new vscode.Range(
+                this._currentSelection.end,
+                this._currentSelection.end
+            ),
+            renderOptions: {
+                after: {
+                    contentText: "Accept | Reject",
+                    backgroundColor: 'var(--vscode-button-background)',
+                    color: 'var(--vscode-button-foreground)',
+                    border: '1px solid var(--vscode-button-border)',
+                    margin: '0 0 0 10px'
+                }
+            }
+        }]);
+    }
+    
+    private async _handleAcceptRefactoring(): Promise<void> {
+        if (!this._currentRefactoring) return;
         
         const editor = vscode.window.activeTextEditor;
         if (!editor) return;
         
-        // Clear decorations
-        editor.setDecorations(this._addedLineDecoration, []);
-        editor.setDecorations(this._removedLineDecoration, []);
+        const { refactored, selection, addedRange } = this._currentRefactoring;
         
-        // Apply the refactoring if provided
-        if (refactoredCode && selection) {
-            await this._applyRefactoring(refactoredCode, selection);
+        try {
+            // First, remove the preview of the refactored code
+            if (addedRange) {
+                await editor.edit(editBuilder => {
+                    editBuilder.delete(new vscode.Range(
+                        selection.end,
+                        addedRange.end
+                    ));
+                });
+            }
+            
+            // Then replace the original selection with the refactored code
+            await editor.edit(editBuilder => {
+                editBuilder.replace(selection, refactored);
+            });
+            
+            vscode.window.showInformationMessage('Code successfully refactored');
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to apply refactoring: ${error}`);
+        } finally {
+            this._cleanupRefactoring();
         }
-        
-        this._isRefactoringInProgress = false;
     }
     
     private async _handleRejectRefactoring(): Promise<void> {
-        // Clean up decorations
-        if (this._currentDecorations) {
-            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
-            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
-            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
-            this._currentDecorations = undefined;
-        }
+        if (!this._currentRefactoring) return;
         
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-            editor.setDecorations(this._addedLineDecoration, []);
-            editor.setDecorations(this._removedLineDecoration, []);
-        }
-        
-        this._isRefactoringInProgress = false;
-        vscode.window.showInformationMessage('Refactoring rejected');
-    }
-
-    private async _applyRefactoring(refactoredCode: string, selection: vscode.Selection): Promise<void> {
         const editor = vscode.window.activeTextEditor;
         if (!editor) return;
         
-        await editor.edit(editBuilder => {
-            editBuilder.replace(selection, refactoredCode);
-        });
+        try {
+            // Remove the preview of the refactored code
+            const { selection, addedRange } = this._currentRefactoring;
+            if (addedRange) {
+                await editor.edit(editBuilder => {
+                    editBuilder.delete(new vscode.Range(
+                        selection.end,
+                        addedRange.end
+                    ));
+                });
+            }
+            
+            vscode.window.showInformationMessage('Refactoring rejected');
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to reject refactoring: ${error}`);
+        } finally {
+            this._cleanupRefactoring();
+        }
+    }
+    
+    private _cleanupRefactoring(): void {
+        const editor = vscode.window.activeTextEditor;
+        if (editor) {
+            editor.setDecorations(this._selectionDecoration, []);
+            editor.setDecorations(this._addedDecoration, []);
+            editor.setDecorations(this._removedDecoration, []);
+            if (this._acceptRejectDecoration) {
+                editor.setDecorations(this._acceptRejectDecoration, []);
+            }
+        }
         
-        vscode.window.showInformationMessage('Code successfully refactored');
+        this._isRefactoringInProgress = false;
+        this._currentRefactoring = undefined;
+        
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = undefined;
+        }
+
+        this._awaitingUserDecision = false;
+    }
+
+    private _handleRefactoringError(error: unknown): void {
+        this._cleanupRefactoring();
+        if (error instanceof Error) {
+            vscode.window.showErrorMessage(`Refactoring failed: ${error.message}`);
+        } else {
+            vscode.window.showErrorMessage('Refactoring failed with an unknown error');
+        }
     }
 
     private _showRefactoringStatus(text: string): void {
@@ -571,23 +506,18 @@ export class CodeRefactoringProvider {
         this._statusBarItem.hide();
     }
 
-    private _escapeHtml(unsafe: string): string {
-        return unsafe
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
-    }
-
     public dispose(): void {
         this._statusBarItem.dispose();
-        this._decoration.dispose();
-        this._addedLineDecoration.dispose();
-        this._removedLineDecoration.dispose();
-        if (this._inlineRefactoringPanel) {
-            this._inlineRefactoringPanel.dispose();
+        this._selectionDecoration.dispose();
+        this._addedDecoration.dispose();
+        this._removedDecoration.dispose();
+        if (this._hoverProviderDisposable) {
+            this._hoverProviderDisposable.dispose();
         }
+        if (this._acceptRejectDecoration) {
+            this._acceptRejectDecoration.dispose();
+        }
+        this._cleanupRefactoring();
     }
 }
 
@@ -1317,10 +1247,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                         <span class="codicon codicon-rocket"></span>
                                         Optimize
                                     </button>
-                                    <button class="input-action-button quick-action" data-action="refactorCode">
-                                        <span class="codicon codicon-symbol-class"></span>
-                                        Refactor
-                                    </button>
+                                    // <button class="input-action-button quick-action" data-action="refactorCode">
+                                    //     <span class="codicon codicon-symbol-class"></span>
+                                    //     Refactor
+                                    // </button>
                                     <button class="input-action-button quick-action" data-action="documentCode">
                                         <span class="codicon codicon-comment"></span>
                                         Document
@@ -1589,7 +1519,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             </button>
                                         </div>
                                     </div>
-                                \;
+                                \`;
                                 
                                 const tempDiv = document.createElement('div');
                                 tempDiv.innerHTML = codeBlockHtml;
@@ -1645,7 +1575,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 truncateText(session.messages[0].content, 28) : session.title;
                             
                             const date = new Date(session.timestamp);
-                            const formattedDate = \${date.toLocaleDateString()} \${date.getHours()}:\${String(date.getMinutes()).padStart(2, '0')}\`;
+                            const formattedDate = \`\${date.toLocaleDateString()} \${date.getHours()}:\${String(date.getMinutes()).padStart(2, '0')}\`;
                             return \`
                                 <div class="session-item \${session.id === currentId ? 'active' : ''}" 
                                      data-session-id="\${session.id}">
@@ -1663,7 +1593,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                         </button>
                                     </div>
                                 </div>
-                            \;
+                            \`;
                         }).join('');
 
                         // Add event listeners after rendering DOM elements
@@ -1729,7 +1659,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 const fileName = pathParts[pathParts.length - 1];
                                 const fileIcon = getFileIcon(fileName);
                                 
-                                return \
+                                return \`
                                     <div class="context-file">
                                         <span class="codicon \${fileIcon} file-icon"></span>
                                         <span class="file-name" title="\${file.path}">\${fileName}</span>
@@ -1737,7 +1667,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             <span class="codicon codicon-close"></span>
                                         </button>
                                     </div>
-                                \;
+                                \`;
                             }).join('');
                             
                             // Add event listeners after rendering
@@ -1794,7 +1724,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             const isBot = group[0].isBot;
                             const sender = isBot ? 'AI Assistant' : 'You';
                             
-                            return \
+                            return \`
                                 <div class="message-group">
                                     <div class="message-sender">\${sender}</div>
                                     \${group.map(msg => {
@@ -1803,11 +1733,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             minute: 'numeric'
                                         }).format(new Date(msg.timestamp));
                                         
-                                        return \
+                                        return \`
                                             <div class="message \${isBot ? 'bot-message' : 'user-message'}" data-message-id="\${msg.id}">
                                                 <div class="message-content">\${msg.content || ''}</div>
                                                 
-                                                \${msg.isStreaming ? \
+                                                \${msg.isStreaming ? \`
                                                     <div class="typing-indicator">
                                                         <span class="typing-dot"></span>
                                                         <span class="typing-dot"></span>
@@ -1818,9 +1748,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                                             <span class="codicon codicon-debug-stop"></span>
                                                         </button>
                                                     </div>
-                                                \ : ''}
+                                                \` : ''}
                                                 
-                                                \${msg.codeSuggestion ? \
+                                                \${msg.codeSuggestion ? \`
                                                     <div class="code-block">
                                                         <div class="code-header">
                                                             <span class="language-tag">\${msg.codeLanguage || 'code'}</span>
@@ -1840,14 +1770,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                                             </button>
                                                         </div>
                                                     </div>
-                                                \ : ''}
+                                                \` : ''}
                                                 
-                                                \${settings.showTimestamps ? \<div class="message-time">\${timestamp}</div>\ : ''}
+                                                \${settings.showTimestamps ? \`<div class="message-time">\${timestamp}</div>\` : ''}
                                             </div>
-                                        \;
+                                        \`;
                                     }).join('')}
                                 </div>
-                            \;
+                            \`;
                         }).join('');
                         
                         // Add event listeners after rendering
@@ -1956,18 +1886,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                     function showToast(message, type = 'info') {
                         const toast = document.createElement('div');
-                        toast.className = \toast toast-\${type}\;
+                        toast.className = \`toast toast-\${type}\`;
                         
                         const icon = type === 'error' ? 'error' : 
                                      type === 'success' ? 'check' : 'info';
                         
-                        toast.innerHTML = \
+                        toast.innerHTML = \`
                             <span class="codicon codicon-\${icon}"></span>
                             <div class="toast-content">\${message}</div>
                             <button class="toast-close">
                                 <span class="codicon codicon-close"></span>
                             </button>
-                        \;
+                        \`;
                         
                         toastContainer.appendChild(toast);
                         
@@ -2176,9 +2106,9 @@ export function activate(context: vscode.ExtensionContext) {
     
     // Register the refactor command
     context.subscriptions.push(
-        vscode.commands.registerCommand('diplugin.refactorCode', async () => {
-            await refactoringProvider.refactorSelectedCode();
-        }),
+        // vscode.commands.registerCommand('diplugin.refactorCode', async () => {
+        //     await refactoringProvider.refactorSelectedCode();
+        // }),
         vscode.commands.registerCommand('diplugin.focusChat', async () => {
             await vscode.commands.executeCommand('workbench.view.extension.diplugin-sidebar');
         }),

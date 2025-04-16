@@ -3,6 +3,7 @@ uvicorn>=0.21.0
 ollama>=0.1.2
 redis>=4.5.5
 langchain>=0.0.340
+langchain-community>=0.3.21
 faiss-cpu>=1.7.4
 sentence-transformers>=2.2.2
 psutil>=5.9.5
