@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from schemas import *
+# from schemas import *
 import random
 import string
 import asyncio
@@ -103,12 +103,8 @@ async def code_optimization(request: CodeOptimizeRequest):
 
 @app.post("/v1/refactor")
 async def code_refactoring(request: RefactorRequest):
-    print(request)
-    async def fake_refactor():
-        for _ in range(4):
-            await asyncio.sleep(0.1)
-            yield generate_dummy_text(60)
-    return StreamingResponse(fake_refactor(), media_type="text/event-stream")
+    print(type(request))
+    return {'original': request.code, 'refactored': generate_dummy_text(60)}
 
 
 @app.get("/health")
@@ -124,7 +120,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "main:app",
+        "local:app",
         host="0.0.0.0",
         port=9693,
         workers=int(os.getenv("WORKERS", "2")),

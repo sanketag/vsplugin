@@ -81,6 +81,15 @@ export class CodeRefactoringProvider {
     private _removedLineDecoration: vscode.TextEditorDecorationType;
     private _inlineRefactoringPanel?: vscode.WebviewPanel;
     private _isRefactoringInProgress: boolean = false;
+    private _refactorCodeLensDisposable?: vscode.Disposable;
+    private _selectionChangeDisposable?: vscode.Disposable;
+
+    private _currentDecorations?: {
+        codelens: vscode.Disposable;
+        added: vscode.TextEditorDecorationType;
+        removed: vscode.TextEditorDecorationType;
+        modified: vscode.TextEditorDecorationType;
+    };
 
     constructor(context: vscode.ExtensionContext) {
         this._context = context;
@@ -121,9 +130,18 @@ export class CodeRefactoringProvider {
         
         // Register commands for accepting/rejecting refactoring
         this._context.subscriptions.push(
-            vscode.commands.registerCommand('diplugin.acceptRefactoring', () => this._handleAcceptRefactoring()),
-            vscode.commands.registerCommand('diplugin.rejectRefactoring', () => this._handleRejectRefactoring())
+            vscode.commands.registerCommand('diplugin.acceptRefactoring', 
+                (refactoredCode, selection) => this._handleAcceptRefactoring(refactoredCode, selection)
+            ),
+            vscode.commands.registerCommand('diplugin.rejectRefactoring', 
+                () => this._handleRejectRefactoring()
+            )
         );
+
+        this._selectionChangeDisposable = vscode.window.onDidChangeTextEditorSelection(e => {
+            this._updateRefactorCodeLens(e.textEditor);
+        });
+        context.subscriptions.push(this._selectionChangeDisposable);
     }
 
     public async refactorSelectedCode(): Promise<void> {
@@ -176,137 +194,6 @@ export class CodeRefactoringProvider {
         });
     }
 
-    private async _callRefactorApi(code: string, targetVersion: string): Promise<string> {
-        this._abortController = new AbortController();
-        const signal = this._abortController.signal;
-        
-        try {
-            const response = await fetch(`${API_BASE_URL}/v1/refactor`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    code: code,
-                    target_version: targetVersion
-                }),
-                signal
-            });
-    
-            if (!response.ok) {
-                throw new Error(`API Error: ${response.status}`);
-            }
-    
-            // Handle streaming response
-            const reader = Readable.toWeb(response.body as any).getReader();
-            if (!reader) {
-                throw new Error('Failed to get response reader');
-            }
-            
-            const decoder = new TextDecoder();
-            let fullResponse = '';
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                
-                const chunk = decoder.decode(value, { stream: true });
-                fullResponse += chunk;
-            }
-            
-            return fullResponse;
-        } finally {
-            this._abortController = undefined;
-        }
-    }
-    
-    private _currentDecorations?: {
-        preview: vscode.TextEditorDecorationType;
-        codelens: vscode.Disposable;
-        timeout: NodeJS.Timeout;
-    };
-
-    private async _showInlineRefactorPreview(originalCode: string, refactoredCode: string, selection: vscode.Selection): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) return;
-        
-        // Calculate the diff
-        const changes = diffLines(originalCode, refactoredCode);
-        
-        // Clear any existing decorations
-        editor.setDecorations(this._decoration, []);
-        
-        // Create decoration for the inline preview
-        const inlinePreviewDecoration = vscode.window.createTextEditorDecorationType({
-            after: {
-                contentText: this._getInlinePreviewText(changes),
-                margin: '10px 0 0 0',
-                border: '1px solid var(--vscode-panel-border)',
-                backgroundColor: 'var(--vscode-editor-background)',
-                width: 'max-content',
-                height: 'max-content',
-                color: 'var(--vscode-editor-foreground)'
-            },
-            isWholeLine: true
-        });
-        
-        // Apply decoration at the start of selection
-        const decorationRange = new vscode.Range(
-            selection.start.line, 0,
-            selection.start.line, 0
-        );
-        
-        editor.setDecorations(inlinePreviewDecoration, [decorationRange]);
-        
-        // Apply diff decorations to highlight changes in the editor
-        this._applyDiffDecorations(editor, selection, originalCode, refactoredCode);
-        
-        this._hideRefactoringStatus();
-        
-        // Create buttons for accept/reject using Codelens
-        const acceptCodeLensProvider: vscode.CodeLensProvider = {
-            provideCodeLenses: (document: vscode.TextDocument) => {
-                if (document.uri.toString() !== editor.document.uri.toString()) return [];
-                
-                const range = new vscode.Range(selection.start.line, 0, selection.start.line, 0);
-                
-                const acceptLens = new vscode.CodeLens(range, {
-                    title: '✓ Accept',
-                    command: 'diplugin.acceptRefactoring',
-                    arguments: [refactoredCode, selection]
-                });
-                
-                const rejectLens = new vscode.CodeLens(range, {
-                    title: '✗ Reject',
-                    command: 'diplugin.rejectRefactoring',
-                    arguments: []
-                });
-                
-                return [acceptLens, rejectLens];
-            }
-        };
-        
-        // Register the codelens provider temporarily
-        const codeLensDisposable = vscode.languages.registerCodeLensProvider(
-            { pattern: editor.document.uri.fsPath },
-            acceptCodeLensProvider
-        );
-        
-        // Set a timer to remove decorations if user doesn't interact
-        const decorationTimeout = setTimeout(() => {
-            inlinePreviewDecoration.dispose();
-            editor.setDecorations(this._addedLineDecoration, []);
-            editor.setDecorations(this._removedLineDecoration, []);
-            codeLensDisposable.dispose();
-            this._isRefactoringInProgress = false;
-        }, 60000); // Remove after 1 minute of inactivity
-        
-        // Store these to dispose later
-        this._currentDecorations = {
-            preview: inlinePreviewDecoration,
-            codelens: codeLensDisposable,
-            timeout: decorationTimeout
-        };
-    }
-    
     // Helper method to generate the text content for the inline preview
     private _getInlinePreviewText(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
         let previewText = 'Refactoring Preview:\n';
@@ -324,57 +211,255 @@ export class CodeRefactoringProvider {
         return previewText + '\n[Enter to Accept, Esc to Reject]';
     }
     
+    private async _callRefactorApi(code: string, targetVersion: string): Promise<string> {
+        this._abortController = new AbortController();
+        const signal = this._abortController.signal;
+        
+        try {
+            const response = await fetch(`${API_BASE_URL}/v1/refactor`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    code: code,
+                    target_version: targetVersion
+                }),
+                signal
+            });
+
+            if (!response.ok) {
+                throw new Error(`API Error: ${response.status}`);
+            }
+
+            const data = await response.json();
+            return data.refactored;
+        } finally {
+            this._abortController = undefined;
+        }
+    }
+
+    private async _showInlineRefactorPreview(originalCode: string, refactoredCode: string, selection: vscode.Selection): Promise<void> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+    
+        // Apply diff decorations first (creates added/removed/modified decorations)
+        this._applyDiffDecorations(editor, selection, originalCode, refactoredCode);
+    
+        // Create CodeLens provider for Accept/Reject
+        const acceptCodeLensProvider: vscode.CodeLensProvider = {
+            provideCodeLenses: (document: vscode.TextDocument) => {
+                if (document.uri.toString() !== editor.document.uri.toString()) return [];
+                
+                const range = new vscode.Range(
+                    selection.end.line,
+                    0,
+                    selection.end.line,
+                    0
+                );
+                
+                return [
+                    new vscode.CodeLens(range, {
+                        title: 'Accept',
+                        command: 'diplugin.acceptRefactoring',
+                        arguments: [refactoredCode, selection]
+                    }),
+                    new vscode.CodeLens(range, {
+                        title: 'Reject',
+                        command: 'diplugin.rejectRefactoring'
+                    })
+                ];
+            }
+        };
+    
+        // Register CodeLens provider and update decorations
+        const codeLensDisposable = vscode.languages.registerCodeLensProvider(
+            { pattern: editor.document.uri.fsPath },
+            acceptCodeLensProvider
+        );
+    
+        // Merge new CodeLens with existing decorations
+        if (this._currentDecorations) {
+            this._currentDecorations.codelens.dispose(); // Dispose previous CodeLens
+            this._currentDecorations.codelens = codeLensDisposable;
+        } else {
+            // Should never happen if _applyDiffDecorations was called properly
+            this._currentDecorations = {
+                codelens: codeLensDisposable,
+                added: this._addedLineDecoration,
+                removed: this._removedLineDecoration,
+                modified: vscode.window.createTextEditorDecorationType({}) // Dummy decoration
+            };
+        }
+    }
+
+    private _updateRefactorCodeLens(editor?: vscode.TextEditor) {
+        if (this._refactorCodeLensDisposable) {
+            this._refactorCodeLensDisposable.dispose();
+        }
+    
+        if (!editor || this._isRefactoringInProgress) return;
+    
+        const selection = editor.selection;
+        if (!selection.isEmpty) {
+            const provider: vscode.CodeLensProvider = {
+                provideCodeLenses: (document: vscode.TextDocument) => {
+                    if (document.uri.toString() !== editor.document.uri.toString()) return [];
+                    
+                    const range = new vscode.Range(
+                        selection.start.line,
+                        selection.start.character,
+                        selection.start.line,
+                        selection.start.character
+                    );
+    
+                    return [
+                        new vscode.CodeLens(range, {
+                            title: '🔧 Refactor',
+                            command: 'diplugin.refactorCode',
+                            tooltip: 'Refactor selected code'
+                        })
+                    ];
+                }
+            };
+    
+            this._refactorCodeLensDisposable = vscode.languages.registerCodeLensProvider(
+                { pattern: editor.document.uri.fsPath },
+                provider
+            );
+        }
+    }
+    
+    // Enhanced diff visualization
     private _applyDiffDecorations(
-        editor: vscode.TextEditor, 
+        editor: vscode.TextEditor,
         selection: vscode.Selection,
-        originalCode: string, 
+        originalCode: string,
         refactoredCode: string
     ): void {
-        const originalLines = originalCode.split('\n');
-        const refactoredLines = refactoredCode.split('\n');
-        
         const changes = diffLines(originalCode, refactoredCode);
-        
         const addedRanges: vscode.Range[] = [];
         const removedRanges: vscode.Range[] = [];
-        
-        let lineOffset = selection.start.line;
-        let currentLine = 0;
-        
-        changes.forEach(change => {
-            const lineCount = change.value.split('\n').length - 1;
-            
-            if (change.added) {
-                // Highlight added lines in green
-                const startLine = lineOffset + currentLine;
-                const endLine = startLine + lineCount;
-                
-                for (let i = startLine; i <= endLine; i++) {
-                    const line = editor.document.lineAt(i);
-                    addedRanges.push(line.range);
-                }
-                
-                currentLine += lineCount;
-            } else if (change.removed) {
-                // Highlight removed lines in red
-                const startLine = lineOffset + currentLine;
-                const endLine = startLine + lineCount;
-                
-                for (let i = startLine; i <= endLine; i++) {
-                    if (i < editor.document.lineCount) {
-                        const line = editor.document.lineAt(i);
-                        removedRanges.push(line.range);
-                    }
-                }
-            } else {
-                // Unchanged lines
-                currentLine += lineCount;
+        const modifiedRanges: vscode.Range[] = [];
+    
+        // Clear previous decorations
+        editor.setDecorations(this._addedLineDecoration, []);
+        editor.setDecorations(this._removedLineDecoration, []);
+    
+        // Create persistent decoration types
+        const addedDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(80,200,80,0.2)',
+            isWholeLine: true,
+            after: {
+                contentText: '', // Will be set per line
+                color: 'green',
+                margin: '0 0 0 20px'
             }
         });
+    
+        const removedDecoration = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(255,100,100,0.2)',
+            isWholeLine: true,
+            before: {
+                contentText: '- ',
+                color: 'red'
+            }
+        });
+    
+        let currentLine = selection.start.line;
+        let virtualLine = selection.end.line + 1;
+        const addedContent: { [key: number]: string } = {};
+    
+        changes.forEach(change => {
+            if (change.added) {
+                // Handle added lines as virtual text
+                const lines = change.value.split('\n').filter(l => l);
+                lines.forEach((line, i) => {
+                    const pos = new vscode.Position(virtualLine + i, 0);
+                    const range = new vscode.Range(pos, pos);
+                    addedRanges.push(range);
+                    addedContent[virtualLine + i] = `+ ${line}`;
+                });
+                virtualLine += lines.length;
+            } else if (change.removed) {
+                // Handle removed lines in original code
+                const start = currentLine;
+                const end = currentLine + (change.count || 0);
+                for (let i = start; i < end; i++) {
+                    if (i >= editor.document.lineCount) break;
+                    const range = editor.document.lineAt(i).range;
+                    removedRanges.push(range);
+                }
+                currentLine = end;
+            } else {
+                currentLine += change.count || 0;
+                virtualLine += change.count || 0;
+            }
+        });
+    
+        // Apply decorations with dynamic content
+        editor.setDecorations(removedDecoration, removedRanges);
+        editor.setDecorations(addedDecoration, addedRanges.map(range => {
+            const lineNum = range.start.line;
+            return {
+                range,
+                renderOptions: {
+                    after: {
+                        contentText: addedContent[lineNum] || ''
+                    }
+                }
+            };
+        }));
+    
+        // Store decorations for cleanup
+        this._currentDecorations = {
+            codelens: this._currentDecorations?.codelens || { dispose: () => {} },
+            added: addedDecoration,
+            removed: removedDecoration,
+            modified: vscode.window.createTextEditorDecorationType({}) // Dummy
+        };
+    }
+    
+    // Updated cleanup methods
+    private async _handleAcceptRefactoring(refactoredCode: string, selection: vscode.Selection): Promise<void> {
+        // Remove the optional chaining operators from parameters
+        const editor = vscode.window.activeTextEditor;
         
-        // Apply decorations
-        editor.setDecorations(this._addedLineDecoration, addedRanges);
-        editor.setDecorations(this._removedLineDecoration, removedRanges);
+        if (this._currentDecorations) {
+            this._currentDecorations.added.dispose();
+            this._currentDecorations.removed.dispose();
+            this._currentDecorations.modified.dispose();
+            this._currentDecorations.codelens.dispose();
+            this._currentDecorations = undefined;
+        }
+    
+        if (editor) {
+            editor.setDecorations(this._addedLineDecoration, []);
+            editor.setDecorations(this._removedLineDecoration, []);
+            
+            if (refactoredCode && selection) {
+                await this._applyRefactoring(refactoredCode, selection);
+            }
+        }
+        
+        this._isRefactoringInProgress = false;
+    }
+    
+    private async _handleRejectRefactoring(): Promise<void> {
+        const editor = vscode.window.activeTextEditor;
+        
+        if (this._currentDecorations) {
+            this._currentDecorations.added.dispose();
+            this._currentDecorations.removed.dispose();
+            this._currentDecorations.modified.dispose();
+            this._currentDecorations.codelens.dispose();
+            this._currentDecorations = undefined;
+        }
+    
+        if (editor) {
+            editor.setDecorations(this._addedLineDecoration, []);
+            editor.setDecorations(this._removedLineDecoration, []);
+        }
+        
+        this._isRefactoringInProgress = false;
     }
 
     private _getInlinePreviewContent(changes: Array<{added?: boolean, removed?: boolean, value: string}>): string {
@@ -506,49 +591,6 @@ export class CodeRefactoringProvider {
             </body>
             </html>
         `;
-    }
-
-    private async _handleAcceptRefactoring(refactoredCode?: string, selection?: vscode.Selection): Promise<void> {
-        // Clean up decorations
-        if (this._currentDecorations) {
-            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
-            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
-            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
-            this._currentDecorations = undefined;
-        }
-        
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) return;
-        
-        // Clear decorations
-        editor.setDecorations(this._addedLineDecoration, []);
-        editor.setDecorations(this._removedLineDecoration, []);
-        
-        // Apply the refactoring if provided
-        if (refactoredCode && selection) {
-            await this._applyRefactoring(refactoredCode, selection);
-        }
-        
-        this._isRefactoringInProgress = false;
-    }
-    
-    private async _handleRejectRefactoring(): Promise<void> {
-        // Clean up decorations
-        if (this._currentDecorations) {
-            if (this._currentDecorations.preview) this._currentDecorations.preview.dispose();
-            if (this._currentDecorations.codelens) this._currentDecorations.codelens.dispose();
-            if (this._currentDecorations.timeout) clearTimeout(this._currentDecorations.timeout);
-            this._currentDecorations = undefined;
-        }
-        
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-            editor.setDecorations(this._addedLineDecoration, []);
-            editor.setDecorations(this._removedLineDecoration, []);
-        }
-        
-        this._isRefactoringInProgress = false;
-        vscode.window.showInformationMessage('Refactoring rejected');
     }
 
     private async _applyRefactoring(refactoredCode: string, selection: vscode.Selection): Promise<void> {

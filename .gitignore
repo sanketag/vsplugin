@@ -6,6 +6,7 @@ node_modules/
 **/.yarn
 **/yarn.lock
 **/package-lock.json
+**/__pycache__/
 
 # Build artifacts
 out/
