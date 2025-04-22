@@ -1631,7 +1631,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             </button>
                                         </div>
                                     </div>
-                                \;
+                                \`;
                                 
                                 const tempDiv = document.createElement('div');
                                 tempDiv.innerHTML = codeBlockHtml;
@@ -1687,7 +1687,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 truncateText(session.messages[0].content, 28) : session.title;
                             
                             const date = new Date(session.timestamp);
-                            const formattedDate = \${date.toLocaleDateString()} \${date.getHours()}:\${String(date.getMinutes()).padStart(2, '0')}\`;
+                            const formattedDate = \`\${date.toLocaleDateString()} \${date.getHours()}:\${String(date.getMinutes()).padStart(2, '0')}\`;
                             return \`
                                 <div class="session-item \${session.id === currentId ? 'active' : ''}" 
                                      data-session-id="\${session.id}">
@@ -1705,7 +1705,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                         </button>
                                     </div>
                                 </div>
-                            \;
+                            \`;
                         }).join('');
 
                         // Add event listeners after rendering DOM elements
@@ -1771,7 +1771,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 const fileName = pathParts[pathParts.length - 1];
                                 const fileIcon = getFileIcon(fileName);
                                 
-                                return \
+                                return \`
                                     <div class="context-file">
                                         <span class="codicon \${fileIcon} file-icon"></span>
                                         <span class="file-name" title="\${file.path}">\${fileName}</span>
@@ -1779,7 +1779,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             <span class="codicon codicon-close"></span>
                                         </button>
                                     </div>
-                                \;
+                                \`;
                             }).join('');
                             
                             // Add event listeners after rendering
@@ -1836,7 +1836,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             const isBot = group[0].isBot;
                             const sender = isBot ? 'AI Assistant' : 'You';
                             
-                            return \
+                            return \`
                                 <div class="message-group">
                                     <div class="message-sender">\${sender}</div>
                                     \${group.map(msg => {
@@ -1845,11 +1845,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                             minute: 'numeric'
                                         }).format(new Date(msg.timestamp));
                                         
-                                        return \
+                                        return \`
                                             <div class="message \${isBot ? 'bot-message' : 'user-message'}" data-message-id="\${msg.id}">
                                                 <div class="message-content">\${msg.content || ''}</div>
                                                 
-                                                \${msg.isStreaming ? \
+                                                \${msg.isStreaming ? \`
                                                     <div class="typing-indicator">
                                                         <span class="typing-dot"></span>
                                                         <span class="typing-dot"></span>
@@ -1860,9 +1860,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                                             <span class="codicon codicon-debug-stop"></span>
                                                         </button>
                                                     </div>
-                                                \ : ''}
+                                                \` : ''}
                                                 
-                                                \${msg.codeSuggestion ? \
+                                                \${msg.codeSuggestion ? \`
                                                     <div class="code-block">
                                                         <div class="code-header">
                                                             <span class="language-tag">\${msg.codeLanguage || 'code'}</span>
@@ -1882,14 +1882,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                                             </button>
                                                         </div>
                                                     </div>
-                                                \ : ''}
+                                                \` : ''}
                                                 
-                                                \${settings.showTimestamps ? \<div class="message-time">\${timestamp}</div>\ : ''}
+                                                \${settings.showTimestamps ? \`<div class="message-time">\${timestamp}</div>\` : ''}
                                             </div>
-                                        \;
+                                        \`;
                                     }).join('')}
                                 </div>
-                            \;
+                            \`;
                         }).join('');
                         
                         // Add event listeners after rendering
@@ -1998,18 +1998,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                     function showToast(message, type = 'info') {
                         const toast = document.createElement('div');
-                        toast.className = \toast toast-\${type}\;
+                        toast.className = \`toast toast-\${type}\`;
                         
                         const icon = type === 'error' ? 'error' : 
                                      type === 'success' ? 'check' : 'info';
                         
-                        toast.innerHTML = \
+                        toast.innerHTML = \`
                             <span class="codicon codicon-\${icon}"></span>
                             <div class="toast-content">\${message}</div>
                             <button class="toast-close">
                                 <span class="codicon codicon-close"></span>
                             </button>
-                        \;
+                        \`;
                         
                         toastContainer.appendChild(toast);
                         
